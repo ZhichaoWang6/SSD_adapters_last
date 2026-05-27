@@ -56,7 +56,7 @@ def _agg(metric_dicts):
         "rounds": rounds,
         "accept_lengths_sum": total,
         "accept_length_with_bonus": safe_div(total, rounds),
-        "accept_length_without_bonus": safe_div(total - rounds, rounds),
+        "accept_length_without_bonus": safe_div(adapter_correct, rounds),
         "spec_tokens": spec_tokens,
         "ar_tokens": ar_tokens,
         "spec_decode_time": spec_decode,

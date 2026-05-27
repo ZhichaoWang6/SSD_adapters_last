@@ -532,7 +532,11 @@ def _metrics(turn_stats):
         'accept_lengths': accept_lengths,
         'accept_lengths_sum': total,
         'accept_length_with_bonus': _safe_div(total, rounds),
-        'accept_length_without_bonus': _safe_div(total - rounds, rounds),
+        # Drafted tokens accepted per round = adapter_correct/rounds. NOT
+        # (sum-rounds)/rounds: a round that ends on a correctly-drafted EOS
+        # has no big-model bonus token, so subtracting a fixed 1 would
+        # undercount the adapter there.
+        'accept_length_without_bonus': _safe_div(adapter_correct, rounds),
         'spec_tokens': spec_tokens,
         'ar_tokens': ar_tokens,
         'spec_decode_time': spec_decode,
