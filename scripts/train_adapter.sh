@@ -1,0 +1,24 @@
+CUDA_VISIBLE_DEVICES=6 accelerate launch \
+    --num_processes 1 --num_machines 1 --mixed_precision bf16 \
+    train_adapter.py \
+    --basepath /data/wangzhichao/projects/MMDuet2/ckpt/MMDuet2_ckpt \
+    --datadir /data/wangzhichao/projects/SSD_adapters/datasets/multiturn_text_48 \
+    --outdir /data/wangzhichao/projects/SSD_adapters/adapter_checkpoints/multiturn_text_4-3 \
+    --exit_layer 4 \
+    --num_adapter_layers 3 \
+    --lr 1e-5 \
+    --bs 2 \
+    --gradient_accumulation_steps 16 \
+    --num_epochs 20 \
+    --num_warmup_steps 30 \
+    --kl_temperature 1.0 \
+    --kl_weight 0.0 \
+    --prefix_ce_tokens 9999 \
+    --prefix_ce_start 1 \
+    --prefix_ce_decay 1.0 \
+    --prefix_ce_weight 1.0 \
+    --grad_clip 1.0 \
+    --save_freq 1 \
+    --min_mask_tokens 0 \
+    --val_ratio 0.05 \
+    --val_seed 42              
