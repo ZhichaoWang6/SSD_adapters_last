@@ -19,6 +19,12 @@ from transformers.cache_utils import DynamicCache
 
 
 _PRINTED_TEXT_POSITION_VERIFY = False
+
+# Per-step debug prints (token decode + stdout) are expensive CPU work. They
+# run inside the timed draft/verify regions while the AR baseline has none, so
+# leaving them on inflates spec time and understates the speedup. Keep OFF for
+# any timing/benchmark run.
+DEBUG = False
 _PRINTED_MM_POSITION_VERIFY = False
 
 
@@ -291,7 +297,8 @@ def kangaroo_speculative_generate(
     draft_times = []
     verify_times = []
 
-    print(f" first token :{tokenizer.decode(first_token)}")
+    if DEBUG:
+        print(f" first token :{tokenizer.decode(first_token)}")
     if first_token.item() in token_eos_set:
         output_ids = global_tokens[:, :start_index + 1]
         torch.cuda.synchronize() if torch.cuda.is_available() else None
@@ -320,7 +327,8 @@ def kangaroo_speculative_generate(
 
         for step in range(1 + round_speculative_steps):
             in_token = global_tokens[:, end_index - 1:end_index]
-            print(f"\nDraft step {step}: in_token={in_token}, in_token_decoded={tokenizer.decode(in_token[0])}, end_index: {end_index}")
+            if DEBUG:
+                print(f"\nDraft step {step}: in_token={in_token}, in_token_decoded={tokenizer.decode(in_token[0])}, end_index: {end_index}")
 
             adapter_cache_len = adapter_past_key_values[0][0].shape[2] if adapter_past_key_values else 0
             if adapter_cache_len < end_index - 1:
@@ -343,10 +351,12 @@ def kangaroo_speculative_generate(
                 adapter_input = torch.cat([hidden_state_early_last, hidden_state_early], dim=1)
 
             if step == round_speculative_steps:
-                print(f"Draft step {step} reached round speculative step limit")
+                if DEBUG:
+                    print(f"Draft step {step} reached round speculative step limit")
                 break
             if step > 0 and predict_score < threshold:
-                print(f"Draft step {step}, token {tokenizer.decode(predicted_token)}, predict_score {predict_score} < threshold {threshold}, stopping draft")
+                if DEBUG:
+                    print(f"Draft step {step}, token {tokenizer.decode(predicted_token)}, predict_score {predict_score} < threshold {threshold}, stopping draft")
                 break
 
             # Build mRoPE position_ids for the adapter explicitly, matching
@@ -386,7 +396,8 @@ def kangaroo_speculative_generate(
             # =====================================
             adapter_confidences.append(predict_score)
             #=======================================
-            print(f"predicted_token: {predicted_token.item()}, predict_score: {predict_score}, token : {tokenizer.decode(predicted_token)}")
+            if DEBUG:
+                print(f"predicted_token: {predicted_token.item()}, predict_score: {predict_score}, token : {tokenizer.decode(predicted_token)}")
 
             global_tokens[:, end_index] = predicted_token
             draft_token_ids.append(predicted_token.item())
@@ -434,7 +445,8 @@ def kangaroo_speculative_generate(
             is_last = (i == output_length - 1)
             is_eos = (verify_id in token_eos_set)
             draft_id = global_tokens[0, start_index + 1 + i].item() if i < len(draft_token_ids) else None
-            print(f"Verifying token {i}: verify_id={verify_id} ({tokenizer.decode(verify_id)}), draft_id={draft_id} ({tokenizer.decode(draft_id) if draft_id is not None else None}), is_last={is_last}, is_eos={is_eos}")
+            if DEBUG:
+                print(f"Verifying token {i}: verify_id={verify_id} ({tokenizer.decode(verify_id)}), draft_id={draft_id} ({tokenizer.decode(draft_id) if draft_id is not None else None}), is_last={is_last}, is_eos={is_eos}")
             is_mismatch = (not is_last and draft_id is not None and verify_id != draft_id)
             # print(f"is_mismatch: {is_mismatch}")
 
@@ -451,7 +463,8 @@ def kangaroo_speculative_generate(
 
             if is_last or is_eos or is_mismatch:
                 global_tokens[0, start_index + 1 + i] = verify_id
-                print(f"Token {i} verification failed, accepting up to this token. is_last: {is_last}, is_eos: {is_eos}, is_mismatch: {is_mismatch}")
+                if DEBUG:
+                    print(f"Token {i} verification failed, accepting up to this token. is_last: {is_last}, is_eos: {is_eos}, is_mismatch: {is_mismatch}")
                 start_index = start_index + 1 + i
                 if is_eos:
                     stop = True
@@ -491,8 +504,9 @@ def kangaroo_speculative_generate(
     # Final output
     output_ids = global_tokens[:, :start_index + 1]
     num_new_tokens = start_index + 1 - context_length
-    print(f"New tokens: {tokenizer.batch_decode(output_ids[:, context_length:])}")
-    print(f"Total new tokens generated: {num_new_tokens}")
+    if DEBUG:
+        print(f"New tokens: {tokenizer.batch_decode(output_ids[:, context_length:])}")
+        print(f"Total new tokens generated: {num_new_tokens}")
     torch.cuda.synchronize() if torch.cuda.is_available() else None
     total_time = time.perf_counter() - t_start
 
