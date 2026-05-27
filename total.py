@@ -37,6 +37,11 @@ def aggregate_bucket(rows, bucket_name):
     tokens = sum(b.get("tokens", 0) for b in buckets)
     rounds = sum(b.get("rounds", 0) for b in buckets)
 
+    # Pool the per-round accepted-length lists across all questions for this
+    # bucket, matching Kangaroo's np.mean(accept_lengths_list).
+    accept_lengths = [a for b in buckets for a in b.get("accept_lengths", [])]
+    accept_lengths_sum = sum(accept_lengths)
+
     adapter_correct = sum(b.get("adapter_correct", 0) for b in buckets)
     adapter_total = sum(b.get("adapter_total", 0) for b in buckets)
     adapter_first_correct = sum(b.get("adapter_first_correct", 0) for b in buckets)
@@ -57,6 +62,8 @@ def aggregate_bucket(rows, bucket_name):
         "turns": turns,
         "tokens": tokens,
         "rounds": rounds,
+        "accept_lengths_sum": accept_lengths_sum,
+        "accept_length_pooled": safe_div(accept_lengths_sum, rounds),
         "progress_per_round": safe_div(
             sum(b.get("progress_per_round", 0) * b.get("rounds", 0) for b in buckets),
             rounds
@@ -211,6 +218,8 @@ def print_generation_summary(title, summary):
         if bucket["turns"]:
             print(
                 f"{label}: turns={bucket['turns']} tokens={bucket['tokens']} | "
+                f"rounds={bucket['rounds']} sum={bucket.get('accept_lengths_sum', 0)} "
+                f"pooled_accept={bucket.get('accept_length_pooled', 0):.2f} | "
                 f"progress/round={bucket['progress_per_round']:.2f} | "
                 f"draft_accept/round={bucket['draft_accept_per_round']:.2f} | "
                 f"adapter={bucket['adapter_correct']}/{bucket['adapter_total']} "

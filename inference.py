@@ -508,6 +508,16 @@ def _summarize_bucket(spec_stats):
         'turns': len(spec_stats),
         'tokens': sum(s.get('total_tokens', 0) for s in spec_stats),
         'rounds': len(accept_lengths),
+        'accept_lengths': accept_lengths,
+        'accept_lengths_sum': sum(accept_lengths),
+        'per_turn': [
+            {
+                'accept_lengths': s.get('accept_lengths', []),
+                'steps': s.get('total_rounds', len(s.get('accept_lengths', []))),
+                'accept_lengths_sum': sum(s.get('accept_lengths', [])),
+            }
+            for s in spec_stats
+        ],
         'progress_per_round': _safe_div(sum(accept_lengths), len(accept_lengths)),
         'draft_accept_per_round': _safe_div(adapter_correct, len(accept_lengths)),
         'adapter_correct': adapter_correct,
