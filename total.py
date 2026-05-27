@@ -42,6 +42,15 @@ def _agg(metric_dicts):
     ar_decode = sum(m.get("ar_decode_time", 0) for m in metric_dicts)
     spec_tps = safe_div(spec_tokens, spec_decode)
     ar_tps = safe_div(ar_tokens, ar_decode)
+
+    adapter_correct = sum(m.get("adapter_correct", 0) for m in metric_dicts)
+    adapter_total = sum(m.get("adapter_total", 0) for m in metric_dicts)
+    adapter_first_correct = sum(m.get("adapter_first_correct", 0) for m in metric_dicts)
+    adapter_first_total = sum(m.get("adapter_first_total", 0) for m in metric_dicts)
+    avg_confidence = safe_div(
+        sum(m.get("avg_confidence", 0) * m.get("adapter_total", 0) for m in metric_dicts),
+        adapter_total,
+    )
     return {
         "turns": turns,
         "rounds": rounds,
@@ -55,6 +64,13 @@ def _agg(metric_dicts):
         "spec_decode_tokens_per_second": round(spec_tps, 2),
         "ar_decode_tokens_per_second": round(ar_tps, 2),
         "speedup": round(safe_div(spec_tps, ar_tps), 4) if ar_tps > 0 else None,
+        "adapter_correct": adapter_correct,
+        "adapter_total": adapter_total,
+        "adapter_accuracy": safe_div(adapter_correct, adapter_total),
+        "adapter_first_correct": adapter_first_correct,
+        "adapter_first_total": adapter_first_total,
+        "adapter_first_accuracy": safe_div(adapter_first_correct, adapter_first_total),
+        "avg_confidence": avg_confidence,
     }
 
 
@@ -74,6 +90,12 @@ def _print_metrics(label, m):
         f"spec {m['spec_decode_tokens_per_second']:.1f} tok/s | "
         f"AR {m['ar_decode_tokens_per_second']:.1f} tok/s | "
         f"speedup {m['speedup'] or 0:.2f}x"
+    )
+    print(
+        f"    adapter top1={m['adapter_correct']}/{m['adapter_total']} "
+        f"({m['adapter_accuracy']:.1%}) | "
+        f"first={m['adapter_first_correct']}/{m['adapter_first_total']} "
+        f"({m['adapter_first_accuracy']:.1%}) | conf={m['avg_confidence']:.3f}"
     )
 
 

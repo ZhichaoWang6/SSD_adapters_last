@@ -514,6 +514,18 @@ def _metrics(turn_stats):
     spec_tps = _safe_div(spec_tokens, spec_decode)
     ar_tps = _safe_div(ar_tokens, ar_decode)
 
+    # Adapter quality (for monitoring training): top1 = drafted token matches
+    # the big model; first = first drafted token of each round.
+    adapter_correct = sum(s.get('adapter_correct', 0) for s in spec)
+    adapter_total = sum(s.get('adapter_total', 0) for s in spec)
+    adapter_first_correct = sum(s.get('adapter_first_correct', 0) for s in spec)
+    adapter_first_total = sum(s.get('adapter_first_total', 0) for s in spec)
+    conf_weight = sum(s.get('adapter_total', 0) for s in spec)
+    avg_confidence = _safe_div(
+        sum(s.get('adapter_avg_confidence', 0) * s.get('adapter_total', 0) for s in spec),
+        conf_weight,
+    )
+
     return {
         'turns': len(spec),
         'rounds': rounds,
@@ -528,6 +540,13 @@ def _metrics(turn_stats):
         'spec_decode_tokens_per_second': round(spec_tps, 2),
         'ar_decode_tokens_per_second': round(ar_tps, 2),
         'speedup': round(_safe_div(spec_tps, ar_tps), 4) if ar_tps > 0 else None,
+        'adapter_correct': adapter_correct,
+        'adapter_total': adapter_total,
+        'adapter_accuracy': _safe_div(adapter_correct, adapter_total),
+        'adapter_first_correct': adapter_first_correct,
+        'adapter_first_total': adapter_first_total,
+        'adapter_first_accuracy': _safe_div(adapter_first_correct, adapter_first_total),
+        'avg_confidence': avg_confidence,
         'per_turn': [
             {
                 'accept_lengths': s.get('accept_lengths', []),
@@ -562,6 +581,12 @@ def _print_metrics(label, m):
         f"spec {m['spec_decode_tokens_per_second']:.1f} tok/s | "
         f"AR {m['ar_decode_tokens_per_second']:.1f} tok/s | "
         f"speedup {m['speedup'] or 0:.2f}x"
+    )
+    print(
+        f"    adapter top1={m['adapter_correct']}/{m['adapter_total']} "
+        f"({m['adapter_accuracy']:.1%}) | "
+        f"first={m['adapter_first_correct']}/{m['adapter_first_total']} "
+        f"({m['adapter_first_accuracy']:.1%}) | conf={m['avg_confidence']:.3f}"
     )
 
 
