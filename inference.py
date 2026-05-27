@@ -34,6 +34,8 @@ def parse_args():
     parser.add_argument("--start_idx", type=int, default=0)
     parser.add_argument("--end_idx", type=int, default=None, help="默认跑完整个数据集")
     parser.add_argument("--max_turns", type=int, default=None, help="最多跑几轮对话，None表示跑完")
+    parser.add_argument("--warmup_turns", type=int, default=2,
+                        help="正式记录前空跑几轮做 GPU 预热（kernel 编译/显存分配），不计入统计。0 表示不预热。")
     parser.add_argument("--device", type=str, default="cuda:4")
 
     # generation args
@@ -704,6 +706,18 @@ def main():
     frame_interval = 1.0
     print(f"setting {frame_interval=} for testing on {args.test_fname=}")
     wrapper.set_fps(frame_interval=frame_interval)
+
+    # GPU warmup: run a few turns through the full spec+AR path so CUDA kernel
+    # compilation / cuBLAS algo selection / allocator costs don't land inside
+    # the timed regions of the first recorded turn. Stats are discarded.
+    if args.warmup_turns and data_list:
+        warmup_example = normalize_example(data_list[0], args.system_prompt, example_idx=0)
+        print(f"[warmup] running {args.warmup_turns} turn(s), stats discarded")
+        wrapper.reset()
+        wrapper.input_query_stream(warmup_example['conversation'])
+        wrapper.inference(max_turns=args.warmup_turns)
+        wrapper.reset()  # clears generation_stats so warmup never enters the results
+        print("[warmup] done")
 
     for example_i, example in enumerate(tqdm(data_list)):
         # Normalize input format: accepts 'conversation' / 'messages' / 'turns'
