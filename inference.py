@@ -489,183 +489,94 @@ def _avg(values):
     return sum(values) / len(values) if values else 0
 
 
-def _summarize_bucket(spec_stats):
-    accept_lengths = [a for s in spec_stats for a in s.get('accept_lengths', [])]
-    adapter_correct = sum(s.get('adapter_correct', 0) for s in spec_stats)
-    adapter_total = sum(s.get('adapter_total', 0) for s in spec_stats)
-    adapter_first_correct = sum(s.get('adapter_first_correct', 0) for s in spec_stats)
-    adapter_first_total = sum(s.get('adapter_first_total', 0) for s in spec_stats)
-    confidence_weight = sum(s.get('adapter_total', 0) for s in spec_stats)
-    if confidence_weight > 0:
-        avg_confidence = sum(
-            s.get('adapter_avg_confidence', 0) * s.get('adapter_total', 0)
-            for s in spec_stats
-        ) / confidence_weight
-    else:
-        avg_confidence = _avg([s.get('adapter_avg_confidence', 0) for s in spec_stats])
+def _metrics(turn_stats):
+    """Accept-length and speedup metrics for a set of turns.
+
+    accept_length_with_bonus    = sum(accept_lengths) / rounds
+        Mean tokens advanced per round, INCLUDING the free token the big
+        model emits every round. Same definition as Kangaroo's mean
+        accepted tokens.
+    accept_length_without_bonus = (sum - rounds) / rounds
+        Pure drafted tokens accepted per round (mean of a-1), with the big
+        model's free token removed.
+    """
+    spec = [s['speculative'] for s in turn_stats if 'speculative' in s]
+    ar = [s['autoregressive'] for s in turn_stats if 'autoregressive' in s]
+
+    accept_lengths = [a for s in spec for a in s.get('accept_lengths', [])]
+    rounds = len(accept_lengths)
+    total = sum(accept_lengths)
+
+    spec_tokens = sum(s.get('total_tokens', 0) for s in spec)
+    ar_tokens = sum(s.get('total_tokens', 0) for s in ar)
+    spec_decode = sum(s.get('decode_time', 0) for s in spec)
+    ar_decode = sum(s.get('decode_time', 0) for s in ar)
+    spec_tps = _safe_div(spec_tokens, spec_decode)
+    ar_tps = _safe_div(ar_tokens, ar_decode)
 
     return {
-        'turns': len(spec_stats),
-        'tokens': sum(s.get('total_tokens', 0) for s in spec_stats),
-        'rounds': len(accept_lengths),
+        'turns': len(spec),
+        'rounds': rounds,
         'accept_lengths': accept_lengths,
-        'accept_lengths_sum': sum(accept_lengths),
+        'accept_lengths_sum': total,
+        'accept_length_with_bonus': _safe_div(total, rounds),
+        'accept_length_without_bonus': _safe_div(total - rounds, rounds),
+        'spec_tokens': spec_tokens,
+        'ar_tokens': ar_tokens,
+        'spec_decode_time': spec_decode,
+        'ar_decode_time': ar_decode,
+        'spec_decode_tokens_per_second': round(spec_tps, 2),
+        'ar_decode_tokens_per_second': round(ar_tps, 2),
+        'speedup': round(_safe_div(spec_tps, ar_tps), 4) if ar_tps > 0 else None,
         'per_turn': [
             {
                 'accept_lengths': s.get('accept_lengths', []),
                 'steps': s.get('total_rounds', len(s.get('accept_lengths', []))),
-                'accept_lengths_sum': sum(s.get('accept_lengths', [])),
             }
-            for s in spec_stats
+            for s in spec
         ],
-        'progress_per_round': _safe_div(sum(accept_lengths), len(accept_lengths)),
-        'draft_accept_per_round': _safe_div(adapter_correct, len(accept_lengths)),
-        'adapter_correct': adapter_correct,
-        'adapter_total': adapter_total,
-        'adapter_accuracy': _safe_div(adapter_correct, adapter_total),
-        'adapter_first_correct': adapter_first_correct,
-        'adapter_first_total': adapter_first_total,
-        'adapter_first_accuracy': _safe_div(adapter_first_correct, adapter_first_total),
-        'avg_confidence': avg_confidence,
     }
 
 
 def summarize_generation_stats(turn_stats):
-    spec_stats = [s['speculative'] for s in turn_stats if 'speculative' in s]
-    ar_stats = [s['autoregressive'] for s in turn_stats if 'autoregressive' in s]
-    matches = [s['output_match'] for s in turn_stats if 'output_match' in s]
-    fallbacks = [s.get('history_fallback_to_ar', False) for s in turn_stats if 'output_match' in s]
-
-    if not spec_stats:
+    turns = [s for s in turn_stats if 'speculative' in s]
+    if not turns:
         return {}
 
-    total_spec_tokens = sum(s.get('total_tokens', 0) for s in spec_stats)
-    total_ar_tokens = sum(s.get('total_tokens', 0) for s in ar_stats)
-    total_spec_decode = sum(s.get('decode_time', 0) for s in spec_stats)
-    total_ar_decode = sum(s.get('decode_time', 0) for s in ar_stats)
-    spec_tps = _safe_div(total_spec_tokens, total_spec_decode)
-    ar_tps = _safe_div(total_ar_tokens, total_ar_decode)
+    short = [s for s in turns
+             if s['speculative'].get('total_tokens', 0) <= SHORT_REPLY_MAX_TOKENS]
+    long_ = [s for s in turns
+             if s['speculative'].get('total_tokens', 0) > SHORT_REPLY_MAX_TOKENS]
 
-    accept_lengths = [a for s in spec_stats for a in s.get('accept_lengths', [])]
-    auto_must_specs = [s for s in spec_stats if s.get('auto_must_reply')]
-    short_specs = [s for s in spec_stats if s.get('total_tokens', 0) <= SHORT_REPLY_MAX_TOKENS]
-    long_specs = [s for s in spec_stats if s.get('total_tokens', 0) > SHORT_REPLY_MAX_TOKENS]
-
-    summary = {
-        'num_turns': len(spec_stats),
-        'spec_tokens': total_spec_tokens,
-        'ar_tokens': total_ar_tokens,
-        'spec_decode_time': total_spec_decode,
-        'ar_decode_time': total_ar_decode,
-        'spec_decode_tokens_per_second': round(spec_tps, 2),
-        'ar_decode_tokens_per_second': round(ar_tps, 2),
-        'actual_decode_speedup': round(_safe_div(spec_tps, ar_tps), 4) if ar_tps > 0 else None,
-        'match_rate': _safe_div(sum(matches), len(matches)) if matches else None,
-        'lossless_matches': sum(matches) if matches else 0,
-        'lossless_total': len(matches),
-        'history_fallback_to_ar': sum(fallbacks),
-        # Total steps (rounds) of this question = number of accepted-length entries.
-        'rounds': len(accept_lengths),
-        # Per-round accepted lengths pooled over all turns of this question,
-        # aligned with Kangaroo's choices[0]['accept_lengths']. Pooled mean
-        # (sum/len) equals progress_per_round.
-        'accept_lengths': accept_lengths,
-        # Sum of the pooled list = total accepted length of this question.
-        'accept_lengths_sum': sum(accept_lengths),
-        # Per-turn breakdown: each turn's own accepted-length list and step count.
-        'per_turn': [
-            {
-                'accept_lengths': s.get('accept_lengths', []),
-                'steps': s.get('total_rounds', len(s.get('accept_lengths', []))),
-                'accept_lengths_sum': sum(s.get('accept_lengths', [])),
-            }
-            for s in spec_stats
-        ],
-        # Old names kept for compatibility with previous output files.
-        'avg_accept_length': _avg([s.get('avg_accept_length', 0) for s in spec_stats]),
-        'avg_draft_accept_length': _avg([s.get('avg_draft_accept_length', 0) for s in spec_stats]),
-        # progress is final output movement; draft_accept counts verified draft tokens, including EOS.
-        'progress_per_round': _safe_div(sum(accept_lengths), len(accept_lengths)),
-        'draft_accept_per_round': _safe_div(sum(s.get('adapter_correct', 0) for s in spec_stats), len(accept_lengths)),
-        'adapter_correct': sum(s.get('adapter_correct', 0) for s in spec_stats),
-        'adapter_total': sum(s.get('adapter_total', 0) for s in spec_stats),
-        'adapter_first_correct': sum(s.get('adapter_first_correct', 0) for s in spec_stats),
-        'adapter_first_total': sum(s.get('adapter_first_total', 0) for s in spec_stats),
-        'auto_must_reply_turns': len(auto_must_specs),
-        'auto_must_reply_context_lens': [s.get('context_len', 0) for s in auto_must_specs],
-        'auto_must_reply_total_tokens': sum(s.get('total_tokens', 0) for s in auto_must_specs),
-        'short_reply': _summarize_bucket(short_specs),
-        'long_reply': _summarize_bucket(long_specs),
-    }
-    window_context_lens = [
-        s.get('window_context_len')
-        for s in spec_stats
-        if s.get('window_context_len') is not None
-    ]
-    if window_context_lens:
-        summary['avg_window_context_len'] = _avg(window_context_lens)
-    summary['adapter_accuracy'] = _safe_div(summary['adapter_correct'], summary['adapter_total'])
-    summary['adapter_first_accuracy'] = _safe_div(summary['adapter_first_correct'], summary['adapter_first_total'])
-    summary['auto_must_reply_progress_per_round'] = (
-        _summarize_bucket(auto_must_specs)['progress_per_round'] if auto_must_specs else None
-    )
+    summary = _metrics(turns)
+    summary['short_reply'] = _metrics(short)
+    summary['long_reply'] = _metrics(long_)
     return summary
+
+
+def _print_metrics(label, m):
+    print(
+        f"[{label}] turns={m['turns']} rounds={m['rounds']} sum={m['accept_lengths_sum']} | "
+        f"accept_len with_bonus={m['accept_length_with_bonus']:.3f} "
+        f"no_bonus={m['accept_length_without_bonus']:.3f} | "
+        f"spec {m['spec_decode_tokens_per_second']:.1f} tok/s | "
+        f"AR {m['ar_decode_tokens_per_second']:.1f} tok/s | "
+        f"speedup {m['speedup'] or 0:.2f}x"
+    )
 
 
 def print_generation_summary(title, summary):
     if not summary:
         return
 
-    print(f"\n--- {title} ({summary['num_turns']} turns) ---")
-    print(
-        f"Actual decode: Spec {summary['spec_tokens']} tok / {summary['spec_decode_time']:.2f}s = "
-        f"{summary['spec_decode_tokens_per_second']:.1f} tok/s | "
-        f"AR {summary['ar_tokens']} tok / {summary['ar_decode_time']:.2f}s = "
-        f"{summary['ar_decode_tokens_per_second']:.1f} tok/s | "
-        f"speedup {summary['actual_decode_speedup'] or 0:.2f}x"
-    )
-    if 'avg_window_context_len' in summary:
-        print(f"Avg window context length: {summary['avg_window_context_len']:.0f}")
-    print(
-        f"Progress/round {summary['progress_per_round']:.2f} | "
-        f"Draft accepted/round {summary['draft_accept_per_round']:.2f} "
-        f"(counts every verified draft token, including EOS)"
-    )
+    print(f"\n--- {title} ({summary['turns']} turns) ---")
+    _print_metrics("Overall", summary)
     for turn_idx, t in enumerate(summary.get('per_turn', [])):
-        print(f"  turn {turn_idx}: steps={t['steps']} | sum={t['accept_lengths_sum']} | list={t['accept_lengths']}")
-    print(
-        f"Question total: steps={summary['rounds']} | "
-        f"sum={summary['accept_lengths_sum']} | list={summary['accept_lengths']}"
-    )
-    print(
-        f"Adapter top1: {summary['adapter_correct']}/{summary['adapter_total']} "
-        f"({summary['adapter_accuracy']:.1%}) | "
-        f"first draft top1: {summary['adapter_first_correct']}/{summary['adapter_first_total']} "
-        f"({summary['adapter_first_accuracy']:.1%})"
-    )
-    if summary['lossless_total']:
-        print(
-            f"Lossless: {summary['lossless_matches']}/{summary['lossless_total']} "
-            f"({summary['match_rate']:.1%}) | fallback_to_AR {summary['history_fallback_to_ar']}"
-        )
-    if summary['auto_must_reply_turns']:
-        print(
-            f"Auto must-reply: {summary['auto_must_reply_turns']} turn(s), "
-            f"context_len={summary['auto_must_reply_context_lens']}"
-        )
-
+        print(f"  turn {turn_idx}: steps={t['steps']} | list={t['accept_lengths']}")
     for label, key in (('Short/NO_REPLY <=5 tok', 'short_reply'), ('Long >5 tok', 'long_reply')):
-        bucket = summary[key]
-        if bucket['turns']:
-            print(
-                f"{label}: turns={bucket['turns']} tokens={bucket['tokens']} | "
-                f"progress/round={bucket['progress_per_round']:.2f} | "
-                f"draft_accept/round={bucket['draft_accept_per_round']:.2f} | "
-                f"adapter={bucket['adapter_correct']}/{bucket['adapter_total']} "
-                f"({bucket['adapter_accuracy']:.1%}) | "
-                f"first={bucket['adapter_first_correct']}/{bucket['adapter_first_total']} "
-                f"({bucket['adapter_first_accuracy']:.1%}) | conf={bucket['avg_confidence']:.3f}"
-            )
+        bucket = summary.get(key)
+        if bucket and bucket['turns']:
+            _print_metrics(label, bucket)
 
 
 def load_examples(path):
@@ -774,47 +685,6 @@ def main():
         if turn_stats:
             print_generation_summary(f"Question {example['question_id']} Summary", id_summary)
             all_stats.extend(turn_stats)
-            continue
-
-        # 每个 question_id 的汇总
-        turn_stats = model_outputs['generation_stats']
-        if turn_stats:
-            id_spec = [s['speculative'] for s in turn_stats if 'speculative' in s]
-            id_ar = [s['autoregressive'] for s in turn_stats if 'autoregressive' in s]
-            id_matches = [s['output_match'] for s in turn_stats if 'output_match' in s]
-            id_fallbacks = [s.get('history_fallback_to_ar', False) for s in turn_stats if 'output_match' in s]
-            if id_spec:
-                id_spec_tokens = sum(s['total_tokens'] for s in id_spec)
-                id_spec_decode = sum(s['decode_time'] for s in id_spec)
-                id_ar_decode = sum(s['decode_time'] for s in id_ar) if id_ar else 0
-                id_avg_accept = sum(s['avg_accept_length'] for s in id_spec) / len(id_spec)
-                id_avg_draft_accept = sum(s['avg_draft_accept_length'] for s in id_spec) / len(id_spec)
-                id_spec_tps = id_spec_tokens / id_spec_decode if id_spec_decode > 0 else 0
-                id_ar_tps = sum(s['total_tokens'] for s in id_ar) / id_ar_decode if id_ar_decode > 0 else 0
-
-                print(f"\n--- Question {example['question_id']} Summary ({len(id_spec)} turns) ---")
-                print(f"Avg accept: {id_avg_accept:.2f} | Avg draft accept: {id_avg_draft_accept:.2f}")
-                print(f"Spec: {id_spec_tps:.1f} tok/s | AR: {id_ar_tps:.1f} tok/s | Speedup: {id_spec_tps/id_ar_tps:.2f}x" if id_ar_tps > 0 else "")
-                print(f"Match: {sum(id_matches)}/{len(id_matches)} | history fallback to AR: {sum(id_fallbacks)}")
-                id_auto_must = sum(1 for s in id_spec if s.get('auto_must_reply'))
-                if id_auto_must:
-                    forced_ctx = [s.get('context_len', 0) for s in id_spec if s.get('auto_must_reply')]
-                    print(f"Auto must-reply: {id_auto_must} turn(s), context_len={forced_ctx}")
-
-                # 长回复置信度
-                long_confs = [s['speculative']['adapter_avg_confidence'] 
-                              for s in turn_stats 
-                              if 'speculative' in s and s['speculative'].get('total_tokens', 0) > 5]
-                short_confs = [s['speculative']['adapter_avg_confidence'] 
-                               for s in turn_stats 
-                               if 'speculative' in s and s['speculative'].get('total_tokens', 0) <= 5]
-                if short_confs:
-                    print(f"Short reply avg confidence: {sum(short_confs)/len(short_confs):.3f} ({len(short_confs)} turns)")
-                if long_confs:
-                    print(f"Long reply avg confidence: {sum(long_confs)/len(long_confs):.3f} ({len(long_confs)} turns)")
-
-                for s in model_outputs['generation_stats']:
-                    all_stats.append(s)
 
     f_out.close()
 
@@ -823,59 +693,7 @@ def main():
         print("AGGREGATE RESULTS")
         print(f"{'='*60}")
         print_generation_summary("All Turns", summarize_generation_stats(all_stats))
-        return
 
-    if all_stats:
-        spec_stats_list = [s['speculative'] for s in all_stats if 'speculative' in s]
-        ar_stats_list = [s['autoregressive'] for s in all_stats if 'autoregressive' in s]
-        matches = [s['output_match'] for s in all_stats if 'output_match' in s]
-        fallbacks = [s.get('history_fallback_to_ar', False) for s in all_stats if 'output_match' in s]
-        decode_speedups = [s['speedup_decode'] for s in all_stats if 'speedup_decode' in s]
-
-        if spec_stats_list:
-            total_spec_tokens = sum(s['total_tokens'] for s in spec_stats_list)
-            total_ar_tokens = sum(s['total_tokens'] for s in ar_stats_list)
-            total_spec_decode_time = sum(s['decode_time'] for s in spec_stats_list)
-            total_ar_decode_time = sum(s['decode_time'] for s in ar_stats_list)
-            avg_accept = sum(s['avg_accept_length'] for s in spec_stats_list) / len(spec_stats_list)
-            avg_draft_accept = sum(s['avg_draft_accept_length'] for s in spec_stats_list) / len(spec_stats_list)
-
-            print(f"\n{'='*60}")
-            print(f"AGGREGATE RESULTS ({len(spec_stats_list)} turns)")
-            print(f"{'='*60}")
-            print(f"Avg accept length: {avg_accept:.2f}")
-            print(f"Avg draft accept length: {avg_draft_accept:.2f}")
-            print(f"Spec decode: {total_spec_tokens} tokens / {total_spec_decode_time:.2f}s = {total_spec_tokens/total_spec_decode_time:.1f} tok/s")
-            print(f"AR decode:   {total_ar_tokens} tokens / {total_ar_decode_time:.2f}s = {total_ar_tokens/total_ar_decode_time:.1f} tok/s")
-            print(f"Overall decode speedup: {(total_spec_tokens/total_spec_decode_time)/(total_ar_tokens/total_ar_decode_time):.2f}x")
-            auto_must = sum(1 for s in spec_stats_list if s.get('auto_must_reply'))
-            if auto_must:
-                print(f"Auto must-reply turns: {auto_must}")
-            if matches:
-                print(f"Lossless match rate: {sum(matches)}/{len(matches)} ({sum(matches)/len(matches):.1%})")
-                print(f"History fallback to AR: {sum(fallbacks)} turns")
-
-                # 长回复置信度和准确率
-            long_confs = []
-            long_correct_total = 0
-            long_total_total = 0
-            short_confs = []
-            short_correct_total = 0
-            short_total_total = 0
-            for s in all_stats:
-                spec = s.get('speculative', {})
-                if spec.get('total_tokens', 0) > 5:
-                    long_confs.append(spec['adapter_avg_confidence'])
-                    long_correct_total += spec.get('adapter_correct', 0)
-                    long_total_total += spec.get('adapter_total', 0)
-                else:
-                    short_confs.append(spec['adapter_avg_confidence'])
-                    short_correct_total += spec.get('adapter_correct', 0)
-                    short_total_total += spec.get('adapter_total', 0)
-            if short_confs:
-                print(f"Short reply: top1={short_correct_total}/{short_total_total} ({short_correct_total/max(short_total_total,1)*100:.1f}%) | avg_confidence={sum(short_confs)/len(short_confs):.3f} ({len(short_confs)} turns)")
-            if long_confs:
-                print(f"Long reply: top1={long_correct_total}/{long_total_total} ({long_correct_total/max(long_total_total,1)*100:.1f}%) | avg_confidence={sum(long_confs)/len(long_confs):.3f} ({len(long_confs)} turns)")
 
 if __name__ == '__main__':
     main()
