@@ -526,6 +526,35 @@ def _metrics(turn_stats):
         conf_weight,
     )
 
+    # Per-round detail. spec_time is measured (draft+verify); the AR time is
+    # estimated from the turn's average AR per-token cost (AR has no rounds),
+    # so per-round speedup is approximate and noisy on very short turns.
+    per_turn = []
+    for rec in turn_stats:
+        s = rec.get('speculative')
+        if not s:
+            continue
+        ar_rec = rec.get('autoregressive', {})
+        al = s.get('accept_lengths', [])
+        dts = s.get('draft_times', [])
+        vts = s.get('verify_times', [])
+        ar_per_tok = _safe_div(ar_rec.get('decode_time', 0), ar_rec.get('total_tokens', 0))
+        rounds_detail = []
+        for i, a in enumerate(al):
+            spec_time = (dts[i] if i < len(dts) else 0.0) + (vts[i] if i < len(vts) else 0.0)
+            ar_time = a * ar_per_tok
+            rounds_detail.append({
+                'accept_length': a,
+                'spec_time': spec_time,
+                'ar_time_est': ar_time,
+                'speedup': round(_safe_div(ar_time, spec_time), 4),
+            })
+        per_turn.append({
+            'steps': len(al),
+            'accept_lengths': al,
+            'rounds': rounds_detail,
+        })
+
     return {
         'turns': len(spec),
         'rounds': rounds,
@@ -551,13 +580,7 @@ def _metrics(turn_stats):
         'adapter_first_total': adapter_first_total,
         'adapter_first_accuracy': _safe_div(adapter_first_correct, adapter_first_total),
         'avg_confidence': avg_confidence,
-        'per_turn': [
-            {
-                'accept_lengths': s.get('accept_lengths', []),
-                'steps': s.get('total_rounds', len(s.get('accept_lengths', []))),
-            }
-            for s in spec
-        ],
+        'per_turn': per_turn,
     }
 
 
@@ -601,7 +624,8 @@ def print_generation_summary(title, summary):
     print(f"\n--- {title} ({summary['turns']} turns) ---")
     _print_metrics("Overall", summary)
     for turn_idx, t in enumerate(summary.get('per_turn', [])):
-        print(f"  turn {turn_idx}: steps={t['steps']} | list={t['accept_lengths']}")
+        round_speedup = [round(r['speedup'], 2) for r in t.get('rounds', [])]
+        print(f"  turn {turn_idx}: steps={t['steps']} | accept={t['accept_lengths']} | round_speedup={round_speedup}")
     for label, key in (('Short/NO_REPLY <=5 tok', 'short_reply'), ('Long >5 tok', 'long_reply')):
         bucket = summary.get(key)
         if bucket and bucket['turns']:
