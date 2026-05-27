@@ -555,6 +555,10 @@ def summarize_generation_stats(turn_stats):
         'lossless_total': len(matches),
         'history_fallback_to_ar': sum(fallbacks),
         'rounds': len(accept_lengths),
+        # Per-round accepted lengths pooled over all turns of this question,
+        # aligned with Kangaroo's choices[0]['accept_lengths']. Pooled mean
+        # (sum/len) equals progress_per_round.
+        'accept_lengths': accept_lengths,
         # Old names kept for compatibility with previous output files.
         'avg_accept_length': _avg([s.get('avg_accept_length', 0) for s in spec_stats]),
         'avg_draft_accept_length': _avg([s.get('avg_draft_accept_length', 0) for s in spec_stats]),
