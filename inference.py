@@ -554,11 +554,23 @@ def summarize_generation_stats(turn_stats):
         'lossless_matches': sum(matches) if matches else 0,
         'lossless_total': len(matches),
         'history_fallback_to_ar': sum(fallbacks),
+        # Total steps (rounds) of this question = number of accepted-length entries.
         'rounds': len(accept_lengths),
         # Per-round accepted lengths pooled over all turns of this question,
         # aligned with Kangaroo's choices[0]['accept_lengths']. Pooled mean
         # (sum/len) equals progress_per_round.
         'accept_lengths': accept_lengths,
+        # Sum of the pooled list = total accepted length of this question.
+        'accept_lengths_sum': sum(accept_lengths),
+        # Per-turn breakdown: each turn's own accepted-length list and step count.
+        'per_turn': [
+            {
+                'accept_lengths': s.get('accept_lengths', []),
+                'steps': s.get('total_rounds', len(s.get('accept_lengths', []))),
+                'accept_lengths_sum': sum(s.get('accept_lengths', [])),
+            }
+            for s in spec_stats
+        ],
         # Old names kept for compatibility with previous output files.
         'avg_accept_length': _avg([s.get('avg_accept_length', 0) for s in spec_stats]),
         'avg_draft_accept_length': _avg([s.get('avg_draft_accept_length', 0) for s in spec_stats]),
@@ -608,6 +620,12 @@ def print_generation_summary(title, summary):
         f"Progress/round {summary['progress_per_round']:.2f} | "
         f"Draft accepted/round {summary['draft_accept_per_round']:.2f} "
         f"(counts every verified draft token, including EOS)"
+    )
+    for turn_idx, t in enumerate(summary.get('per_turn', [])):
+        print(f"  turn {turn_idx}: steps={t['steps']} | sum={t['accept_lengths_sum']} | list={t['accept_lengths']}")
+    print(
+        f"Question total: steps={summary['rounds']} | "
+        f"sum={summary['accept_lengths_sum']} | list={summary['accept_lengths']}"
     )
     print(
         f"Adapter top1: {summary['adapter_correct']}/{summary['adapter_total']} "
