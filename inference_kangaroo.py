@@ -18,7 +18,6 @@ import torch
 from transformers.cache_utils import DynamicCache
 
 
-_PRINTED_TEXT_POSITION_VERIFY = False
 
 # Per-step debug prints (token decode + stdout) are expensive CPU work. They
 # run inside the timed draft/verify regions while the AR baseline has none, so
@@ -50,127 +49,8 @@ def apply_repetition_penalty(logits, prefix_ids, penalty, eos_ids_set=None):
         for eos_id in eos_ids_set:
             modified[..., eos_id] = logits[..., eos_id]
     return modified
-_PRINTED_MM_POSITION_VERIFY = False
 
 
-def _verify_adapter_prefill_positions(prefill_position_ids):
-    """One-time-per-modality runtime sanity check on the adapter's prefill
-    position_ids. Prints once for the first pure-text input, and once
-    again for the first multimodal input where rope_deltas takes effect.
-    This way streaming-VL pipelines (text-only first turn, then frames
-    accumulate) reveal both code paths.
-    """
-    global _PRINTED_TEXT_POSITION_VERIFY, _PRINTED_MM_POSITION_VERIFY
-
-    pos = prefill_position_ids.detach().cpu()
-    if pos.dim() == 3 and pos.shape[1] == 1:
-        pos = pos[:, 0, :]
-    L = pos.shape[-1]
-    T_ch, H_ch, W_ch = pos[0], pos[1], pos[2]
-
-    # Region detection (same logic as debug_rope_positions.py)
-    regions = []
-    cur_kind = None
-    cur_start = 0
-    for i in range(L):
-        t, h, w = int(T_ch[i]), int(H_ch[i]), int(W_ch[i])
-        if t == h == w == i:
-            kind = 'text_a'
-        elif t == h == w:
-            kind = 'text_b'
-        else:
-            kind = 'image'
-        if cur_kind is None:
-            cur_kind = kind
-        elif kind != cur_kind:
-            regions.append((cur_kind, cur_start, i))
-            cur_kind = kind
-            cur_start = i
-    regions.append((cur_kind, cur_start, L))
-
-    n_text_a = sum(1 for k, _, _ in regions if k == 'text_a')
-    n_image = sum(1 for k, _, _ in regions if k == 'image')
-    n_text_b = sum(1 for k, _, _ in regions if k == 'text_b')
-    is_multimodal = (n_image > 0)
-
-    # Skip if we've already printed the verification for this modality.
-    if is_multimodal:
-        if _PRINTED_MM_POSITION_VERIFY:
-            return
-        _PRINTED_MM_POSITION_VERIFY = True
-    else:
-        if _PRINTED_TEXT_POSITION_VERIFY:
-            return
-        _PRINTED_TEXT_POSITION_VERIFY = True
-
-    last_text_b_idx = None
-    for kind, s, e in reversed(regions):
-        if kind == 'text_b':
-            last_text_b_idx = e - 1
-            break
-    estimated_rope_delta = int(T_ch[last_text_b_idx] - last_text_b_idx) if last_text_b_idx is not None else 0
-
-    buggy = torch.arange(L)
-    rows = []
-    for kind, s, e in regions:
-        proper_t = T_ch[s:e]
-        proper_h = H_ch[s:e]
-        proper_w = W_ch[s:e]
-        proper_max_d = max(
-            int((proper_t - buggy[s:e]).abs().max()),
-            int((proper_h - buggy[s:e]).abs().max()),
-            int((proper_w - buggy[s:e]).abs().max()),
-        )
-        rows.append((kind, s, e, proper_max_d))
-
-    print("=" * 78)
-    label = "MULTIMODAL" if is_multimodal else "PURE-TEXT"
-    print(f"[adapter prefill] {label} position_id verification (first {label.lower()} input)")
-    print(f"  seq_len:              {L}")
-    print(f"  regions detected:     {len(regions)}  "
-          f"(text_a={n_text_a}, image={n_image}, text_b={n_text_b})")
-    print(f"  T/H/W differ?:        "
-          f"{bool((T_ch != H_ch).any() or (T_ch != W_ch).any())}  "
-          f"(True means image tokens have proper 3D mRoPE)")
-    print(f"  estimated rope_delta: {estimated_rope_delta}  "
-          f"(from last text_b position - input index)")
-    print(f"  max position value:   {int(pos.max())}")
-    print(f"  first 5 positions:    T={T_ch[:5].tolist()}  "
-          f"H={H_ch[:5].tolist()}  W={W_ch[:5].tolist()}")
-    print(f"  last 5 positions:     T={T_ch[-5:].tolist()}  "
-          f"H={H_ch[-5:].tolist()}  W={W_ch[-5:].tolist()}")
-
-    print("-" * 78)
-    print("  Region summary (first 6 + last 3 shown if many):")
-    if len(rows) > 9:
-        show = rows[:6] + [("...", -1, -1, -1)] + rows[-3:]
-    else:
-        show = rows
-    for entry in show:
-        kind, s, e, max_d_vs_buggy = entry
-        if kind == "...":
-            print(f"    ... ({len(rows) - 9} more regions) ...")
-            continue
-        delta_str = f"max|delta| vs buggy arange = {max_d_vs_buggy}"
-        if kind == 'text_a':
-            note = "(buggy would also be correct here)"
-        else:
-            note = "(buggy is WRONG here -> fix matters)"
-        print(f"    {kind:8s} [{s:5d}..{e:5d}]  len={e-s:5d}   {delta_str:35s}  {note}")
-
-    if not is_multimodal:
-        print("  >>> Pure-text input (no images / video). All three position variants")
-        print("      would produce identical results. The fix has no effect here.")
-        print("      (verification will fire again the first time a multimodal input arrives)")
-    else:
-        bad = sum(1 for _, _, _, d in rows if d > 0)
-        total = len(rows)
-        if bad > 0:
-            print(f"  >>> Multimodal input: buggy version would be WRONG on {bad}/{total} regions")
-            print(f"      Current code (v2 get_rope_index) gives the proper positions. ✓")
-        else:
-            print("  >>> All regions agree with arange; nothing for the fix to correct.")
-    print("=" * 78)
 
 
 def _build_stats(accept_length_list, prefill_time, draft_times, verify_times, total_time, num_new_tokens):
@@ -317,8 +197,7 @@ def kangaroo_speculative_generate(
     prefill_position_ids = prefill_position_ids.to(hidden_state_early.device)
     # Shape is (3, batch, seq_len) already, matching adapter's expectation.
 
-    # ---- One-time runtime sanity check: confirm position_ids look right ----
-    _verify_adapter_prefill_positions(prefill_position_ids)
+
 
     _, adapter_past_key_values = adapter_model.forward_early_stop(
         inputs_embeds=hidden_state_early,

@@ -58,34 +58,6 @@ def parse_args():
     parser.add_argument("--disable_adapter_mlp", action="store_true")
     parser.add_argument("--speculative_threshold", type=float, default=0.6)
     parser.add_argument("--speculative_steps", type=int, default=6)
-    parser.add_argument(
-        "--must_reply_before_context_tokens",
-        type=int,
-        default=0,
-        help="If >0, force one must-reply generation when the prompt reaches this token length "
-             "and no non-NO REPLY answer has appeared yet.",
-    )
-    parser.add_argument(
-        "--must_reply_prompt",
-        type=str,
-        default="[DIAGNOSTIC_MUST_REPLY] For this diagnostic turn only, ignore whether the original question is answerable. Output one concise English sentence describing visible actions or objects in the video so far. The answer must not be NO REPLY.\n",
-    )
-    parser.add_argument(
-        "--must_reply_patch_system",
-        action="store_true",
-        help="Temporarily add a system-level diagnostic override for must-reply turns.",
-    )
-    parser.add_argument(
-        "--must_reply_system_patch",
-        type=str,
-        default="Diagnostic override: when the current user message contains [DIAGNOSTIC_MUST_REPLY], you must produce a non-empty one-sentence description of visible video content. Do not output NO REPLY for that turn.",
-    )
-    parser.add_argument(
-        "--must_reply_even_if_replied",
-        action="store_true",
-        help="Force the threshold reply even if a previous non-NO REPLY answer already appeared.",
-    )
-    parser.add_argument("--must_reply_verbose", action="store_true")
 
     args = parser.parse_args()
     return args
@@ -154,19 +126,6 @@ class ProactiveInferenceClient:
 
         self.history = list()
         self.prev_frame_before_token_drop = None    # for dynamic token drop
-        self.must_reply_prompt = getattr(args, "must_reply_prompt", None) or (
-            "I must reply now based on the video so far. Answer concisely and do not output NO REPLY.\n"
-        )
-        if not self.must_reply_prompt.endswith("\n"):
-            self.must_reply_prompt += "\n"
-        self.must_reply_before_context_tokens = int(
-            getattr(args, "must_reply_before_context_tokens", 0) or 0
-        )
-        self.must_reply_patch_system = bool(getattr(args, "must_reply_patch_system", False))
-        self.must_reply_system_patch = getattr(args, "must_reply_system_patch", "") or ""
-        self.must_reply_even_if_replied = bool(getattr(args, "must_reply_even_if_replied", False))
-        self.must_reply_verbose = bool(getattr(args, "must_reply_verbose", False))
-        self.auto_must_reply_done = False
         self.prev_image_inputs = list()
         self.prev_video_inputs = list()
         self.all_keep_masks = list()
@@ -199,7 +158,6 @@ class ProactiveInferenceClient:
         self.prev_video_inputs = list()
         self.all_keep_masks = list()
         self.generation_stats = []
-        self.auto_must_reply_done = False
         if hasattr(self.model, 'reset_status'):
             self.model.reset_status()
         if self.kangaroo_model is not None:
@@ -226,87 +184,6 @@ class ProactiveInferenceClient:
                     num_frames += self._recursive_stat_num_frames(input)
         return num_frames
 
-    def _is_non_no_reply(self, text):
-        normalized = str(text or "").strip()
-        return normalized not in {"", "NO REPLY", "NO_REPLY"}
-
-    def _history_has_non_no_reply(self):
-        return any(
-            turn.get("role") == "assistant" and self._is_non_no_reply(turn.get("content"))
-            for turn in self.history
-        )
-
-    def _should_auto_must_reply(self, query, context_len):
-        if self.must_reply_before_context_tokens <= 0:
-            return False
-        if self.auto_must_reply_done:
-            return False
-        if query.get("role") != "user" or query.get("skip_inference", False):
-            return False
-        if not self.must_reply_even_if_replied and self._history_has_non_no_reply():
-            self.auto_must_reply_done = True
-            return False
-        if context_len < self.must_reply_before_context_tokens:
-            return False
-
-        self.auto_must_reply_done = True
-        if self.must_reply_verbose:
-            print(
-                "[must-reply] forcing one reply at "
-                f"context_len={context_len}, threshold={self.must_reply_before_context_tokens}"
-            )
-        return True
-
-    def _mark_reply_observed(self, reply_text):
-        if self._is_non_no_reply(reply_text):
-            self.auto_must_reply_done = True
-
-    def _append_must_reply_to_user_turn(self, turn):
-        if turn.get("role") != "user":
-            return
-        prompt = self.must_reply_prompt.strip()
-        if not prompt:
-            return
-        content = turn.get("content")
-        if isinstance(content, list):
-            if not any(
-                isinstance(item, dict)
-                and item.get("type") == "text"
-                and item.get("text") == prompt
-                for item in content
-            ):
-                content.append({"type": "text", "text": prompt})
-        elif isinstance(content, str):
-            if prompt not in content:
-                turn["content"] = content.rstrip() + "\n" + prompt
-        else:
-            turn["content"] = [{"type": "text", "text": prompt}]
-
-    def _patch_system_for_must_reply(self):
-        if not self.must_reply_patch_system or not self.must_reply_system_patch:
-            return
-        marker = "[DIAGNOSTIC_MUST_REPLY]"
-        for turn in self.history:
-            if turn.get("role") != "system":
-                continue
-            content = turn.get("content", "")
-            if isinstance(content, str):
-                if marker not in content:
-                    turn["content"] = content.rstrip() + "\n\n" + self.must_reply_system_patch
-            elif isinstance(content, list):
-                has_patch = any(
-                    isinstance(item, dict)
-                    and marker in str(item.get("text", ""))
-                    for item in content
-                )
-                if not has_patch:
-                    content.append({"type": "text", "text": self.must_reply_system_patch})
-            return
-
-    def _prepare_must_reply_turn(self, query):
-        self._append_must_reply_to_user_turn(query)
-        self._patch_system_for_must_reply()
-
     def _encode_query(self):
         newly_added_turns = list()
         while True:
@@ -322,14 +199,6 @@ class ProactiveInferenceClient:
             self.history, tokenize=False, add_generation_prompt=True,
         )
 
-        must_reply = bool(query.get('must_reply', False))
-        auto_must_reply = False
-        if must_reply and self.must_reply_before_context_tokens > 0:
-            self.auto_must_reply_done = True
-            self._prepare_must_reply_turn(query)
-            text = self.processor.apply_chat_template(
-                self.history, tokenize=False, add_generation_prompt=True,
-            )
         prompt_text = text
 
         new_image_inputs, new_video_inputs = process_vision_info(newly_added_turns)
@@ -352,23 +221,6 @@ class ProactiveInferenceClient:
             return_tensors="pt",
         )
         context_len = int(inputs.input_ids.shape[1])
-        if not must_reply:
-            auto_must_reply = self._should_auto_must_reply(query, context_len)
-            if auto_must_reply:
-                must_reply = True
-                query["must_reply"] = True
-                self._prepare_must_reply_turn(query)
-                prompt_text = self.processor.apply_chat_template(
-                    self.history, tokenize=False, add_generation_prompt=True,
-                )
-                inputs = self.processor(
-                    text=[prompt_text],
-                    images=image_inputs,
-                    videos=video_inputs,
-                    padding=True,
-                    return_tensors="pt",
-                )
-                context_len = int(inputs.input_ids.shape[1])
         inputs = inputs.to(self.device)
         # print("==============================================================")
 
@@ -399,8 +251,6 @@ class ProactiveInferenceClient:
                 eos_token_ids=self.eos_token_ids,
             )
             spec_stats["context_len"] = context_len
-            spec_stats["must_reply"] = must_reply
-            spec_stats["auto_must_reply"] = auto_must_reply
             combined_stats = {'speculative': spec_stats}
 
             # 重置模型状态，确保 AR baseline 和 speculative decoding 起点一致
@@ -422,8 +272,6 @@ class ProactiveInferenceClient:
                 eos_token_ids=self.eos_token_ids,
             )
             ar_stats["context_len"] = context_len
-            ar_stats["must_reply"] = must_reply
-            ar_stats["auto_must_reply"] = auto_must_reply
  
             # print(f"AR (manual) generated text: {ar_text}")
             # print(f"AR (manual) stats: {ar_stats}")
@@ -457,7 +305,6 @@ class ProactiveInferenceClient:
 
         history_reply_text = ar_text if self.compare_AR_SSD and 'ar_text' in locals() and reply_text != ar_text else reply_text
         self.history.append({'role': 'assistant', 'content': history_reply_text, 'time': self.video_time})
-        self._mark_reply_observed(history_reply_text)
 
     def inference(self, max_turns=None):
         turn_count = 0
