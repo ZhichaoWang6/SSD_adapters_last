@@ -25,6 +25,31 @@ _PRINTED_TEXT_POSITION_VERIFY = False
 # leaving them on inflates spec time and understates the speedup. Keep OFF for
 # any timing/benchmark run.
 DEBUG = False
+
+
+def apply_repetition_penalty(logits, prefix_ids, penalty, eos_ids_set=None):
+    """Apply repetition penalty to a (1, vocab) logits tensor.
+
+    - logits: (1, vocab) float tensor.
+    - prefix_ids: 1D tensor of token ids generated in the current turn so far.
+    - penalty > 1.0 lowers the probability of tokens already in prefix_ids.
+    - eos_ids_set: ids that must NOT be penalized (so the model can still stop).
+
+    Matches HF's RepetitionPenaltyLogitsProcessor semantics: positive logits are
+    divided by penalty, negative logits are multiplied. Idempotent across
+    duplicates (scatter writes once per unique id).
+    """
+    if penalty == 1.0 or prefix_ids.numel() == 0:
+        return logits
+    prefix_2d = prefix_ids.view(1, -1).to(device=logits.device, dtype=torch.long)
+    score = torch.gather(logits, 1, prefix_2d)
+    score = torch.where(score < 0, score * penalty, score / penalty)
+    modified = logits.clone()
+    modified.scatter_(1, prefix_2d, score)
+    if eos_ids_set:
+        for eos_id in eos_ids_set:
+            modified[..., eos_id] = logits[..., eos_id]
+    return modified
 _PRINTED_MM_POSITION_VERIFY = False
 
 
@@ -184,6 +209,8 @@ def kangaroo_speculative_generate(
     threshold: float = 0.6,
     do_sample: bool = False,
     past_key_values=None,
+    repetition_penalty: float = 1.0,
+    eos_token_ids=None,
 ):
     # =======================
     adapter_correct = 0
@@ -217,12 +244,20 @@ def kangaroo_speculative_generate(
     device = inputs['input_ids'].device
 
     tokenizer = processor.tokenizer if hasattr(processor, 'tokenizer') else processor
-    token_eos = tokenizer.eos_token_id
-    if isinstance(token_eos, list):
-        token_eos_set = set(token_eos)
-        token_eos = token_eos[0]
+    # Prefer the caller's explicit eos_token_ids (typically from
+    # model.generation_config.eos_token_id, which for Qwen2.5-VL is
+    # [<|im_end|>=151645, <|endoftext|>=151643]). Fall back to the tokenizer's
+    # single eos_token_id otherwise (often just one of them).
+    if eos_token_ids is not None:
+        token_eos_set = set(eos_token_ids) if isinstance(eos_token_ids, (list, tuple, set)) else {eos_token_ids}
+        token_eos = next(iter(token_eos_set))
     else:
-        token_eos_set = {token_eos}
+        token_eos = tokenizer.eos_token_id
+        if isinstance(token_eos, list):
+            token_eos_set = set(token_eos)
+            token_eos = token_eos[0]
+        else:
+            token_eos_set = {token_eos}
 
     input_ids = inputs['input_ids']
     batch_size, context_length = input_ids.shape
@@ -390,7 +425,16 @@ def kangaroo_speculative_generate(
             )
 
             predict_logits = head_model(hidden_state[:, -1:, :]).float()
-            predicted_token = torch.argmax(predict_logits[:, -1, :], dim=-1)
+            # Apply repetition penalty over tokens generated so far IN THIS TURN
+            # (excludes the prompt). Same prefix/penalty/eos as the verify and
+            # AR sides → spec lossless to "AR with same penalty" is preserved.
+            draft_pos_logits = predict_logits[:, -1, :]
+            if repetition_penalty != 1.0:
+                draft_prefix = global_tokens[0, context_length:end_index]
+                draft_pos_logits = apply_repetition_penalty(
+                    draft_pos_logits, draft_prefix, repetition_penalty, token_eos_set,
+                )
+            predicted_token = torch.argmax(draft_pos_logits, dim=-1)
 
             predict_score = predict_logits.softmax(dim=-1).max().item()
             # =====================================
@@ -433,7 +477,21 @@ def kangaroo_speculative_generate(
             in_features_large=exited_hidden_states,
         )
         verify_logits = head_model(hidden_state_normed).float()
-        verify_ids = torch.argmax(verify_logits, dim=-1)[0].tolist()
+        if repetition_penalty != 1.0:
+            # Each verify position i predicts token at start_index+1+i. Its
+            # prefix (this-turn generated so far) is global_tokens[context_length
+            # : start_index+1+i]. Apply per-position to match HF's per-step
+            # advancing prefix, so spec stays lossless to AR.
+            verify_ids = []
+            for j in range(verify_logits.shape[1]):
+                pos_logits = verify_logits[:, j, :]
+                pos_prefix = global_tokens[0, context_length:start_index + 1 + j]
+                pos_logits = apply_repetition_penalty(
+                    pos_logits, pos_prefix, repetition_penalty, token_eos_set,
+                )
+                verify_ids.append(int(torch.argmax(pos_logits, dim=-1).item()))
+        else:
+            verify_ids = torch.argmax(verify_logits, dim=-1)[0].tolist()
 
         for i, verify_id in enumerate(verify_ids):
             write_index = start_index + 1 + i
@@ -551,6 +609,8 @@ def speculative_generate_for_streaming(
     early_exit_layer: int = 2,
     speculative_steps: int = 6,
     threshold: float = 0.6,
+    repetition_penalty: float = 1.0,
+    eos_token_ids=None,
 ):
     output_ids, past_key_values, stats = kangaroo_speculative_generate(
         model=model,
@@ -562,6 +622,8 @@ def speculative_generate_for_streaming(
         threshold=threshold,
         do_sample=False,
         past_key_values=past_key_values,
+        repetition_penalty=repetition_penalty,
+        eos_token_ids=eos_token_ids,
     )
     # print(f"Speculative generation completed. Stats: {stats}")
 

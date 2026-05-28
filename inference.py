@@ -36,6 +36,9 @@ def parse_args():
     parser.add_argument("--max_turns", type=int, default=None, help="最多跑几轮对话，None表示跑完")
     parser.add_argument("--warmup_turns", type=int, default=2,
                         help="正式记录前空跑几轮做 GPU 预热（kernel 编译/显存分配），不计入统计。0 表示不预热。")
+    parser.add_argument("--repetition_penalty", type=float, default=None,
+                        help="logits 上的重复惩罚，spec/AR/draft 三处统一套，仍 lossless。"
+                             "不传则从 model.generation_config 读，读不到则 1.0（关闭）。")
     parser.add_argument("--device", type=str, default="cuda:4")
 
     # generation args
@@ -128,6 +131,26 @@ class ProactiveInferenceClient:
         self.do_sample = args.do_sample
         self.temperature = args.temperature
         self.top_k = args.top_k
+
+        # Resolve repetition_penalty: CLI > model.generation_config > 1.0.
+        # Resolve EOS ids:           model.generation_config > tokenizer.eos.
+        # We pass these into spec / AR / draft three places so the greedy
+        # logits path matches what model.generate() would apply, and the eos
+        # set covers BOTH <|im_end|> and <|endoftext|> as Qwen2.5-VL ships.
+        gen_cfg = getattr(self.model, 'generation_config', None)
+        if args.repetition_penalty is not None:
+            self.repetition_penalty = float(args.repetition_penalty)
+        else:
+            self.repetition_penalty = float(getattr(gen_cfg, 'repetition_penalty', 1.0) or 1.0)
+        cfg_eos = getattr(gen_cfg, 'eos_token_id', None) if gen_cfg is not None else None
+        if cfg_eos is not None:
+            self.eos_token_ids = list(cfg_eos) if isinstance(cfg_eos, (list, tuple, set)) else [int(cfg_eos)]
+        else:
+            tok_eos = self.processor.tokenizer.eos_token_id if hasattr(self.processor, 'tokenizer') else None
+            self.eos_token_ids = list(tok_eos) if isinstance(tok_eos, (list, tuple, set)) else (
+                [int(tok_eos)] if tok_eos is not None else None
+            )
+        logger.info(f"repetition_penalty={self.repetition_penalty}, eos_token_ids={self.eos_token_ids}")
 
         self.history = list()
         self.prev_frame_before_token_drop = None    # for dynamic token drop
@@ -372,6 +395,8 @@ class ProactiveInferenceClient:
                 early_exit_layer=self.exit_layer,
                 speculative_steps=self.speculative_steps,
                 threshold=self.speculative_threshold,
+                repetition_penalty=self.repetition_penalty,
+                eos_token_ids=self.eos_token_ids,
             )
             spec_stats["context_len"] = context_len
             spec_stats["must_reply"] = must_reply
@@ -393,6 +418,8 @@ class ProactiveInferenceClient:
                 processor=self.processor,
                 max_new_tokens=512,
                 early_exit_layer=self.exit_layer,
+                repetition_penalty=self.repetition_penalty,
+                eos_token_ids=self.eos_token_ids,
             )
             ar_stats["context_len"] = context_len
             ar_stats["must_reply"] = must_reply

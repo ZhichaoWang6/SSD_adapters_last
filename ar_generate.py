@@ -35,6 +35,8 @@ import time
 import copy
 import torch
 
+from inference_kangaroo import apply_repetition_penalty
+
 
 @torch.no_grad()
 def autoregressive_manual_baseline(
@@ -43,6 +45,8 @@ def autoregressive_manual_baseline(
     processor,       # tokenizer/processor
     max_new_tokens: int = 512,
     early_exit_layer: int = 2,
+    repetition_penalty: float = 1.0,
+    eos_token_ids=None,
 ):
     """
     使用和 speculative decoding 完全相同的 forward 路径做 AR 生成。
@@ -63,11 +67,14 @@ def autoregressive_manual_baseline(
     device = inputs['input_ids'].device
 
     tokenizer = processor.tokenizer if hasattr(processor, 'tokenizer') else processor
-    token_eos = tokenizer.eos_token_id
-    if isinstance(token_eos, list):
-        token_eos_set = set(token_eos)
+    if eos_token_ids is not None:
+        token_eos_set = set(eos_token_ids) if isinstance(eos_token_ids, (list, tuple, set)) else {eos_token_ids}
     else:
-        token_eos_set = {token_eos}
+        token_eos = tokenizer.eos_token_id
+        if isinstance(token_eos, list):
+            token_eos_set = set(token_eos)
+        else:
+            token_eos_set = {token_eos}
 
     input_ids = inputs['input_ids']
     batch_size, context_length = input_ids.shape
@@ -131,9 +138,16 @@ def autoregressive_manual_baseline(
             in_features_large=draft_hidden,
         )
 
-        # Logits → next token
+        # Logits → next token (with optional repetition penalty over this
+        # turn's generated tokens, matching the spec / draft paths).
         logits = head_model(hidden_normed).float()
-        next_token_id = torch.argmax(logits[:, -1, :], dim=-1).item()
+        pos_logits = logits[:, -1, :]
+        if repetition_penalty != 1.0:
+            prefix = torch.tensor(generated_tokens, device=device, dtype=torch.long)
+            pos_logits = apply_repetition_penalty(
+                pos_logits, prefix, repetition_penalty, token_eos_set,
+            )
+        next_token_id = torch.argmax(pos_logits, dim=-1).item()
         generated_tokens.append(next_token_id)
 
     # ========== 统计 ==========
