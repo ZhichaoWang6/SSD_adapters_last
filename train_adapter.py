@@ -54,7 +54,14 @@ def parse_args():
                              "Set to a large number (e.g. 9999) to apply CE on ALL supervised "
                              "positions (turns CE into a full LM-style loss).")
     parser.add_argument("--prefix_ce_weight", type=float, default=1.0,
-                        help="Weight for the weighted prefix teacher-argmax CE term.")
+                        help="Weight for the weighted prefix CE term.")
+    parser.add_argument("--ce_target", type=str, default="teacher",
+                        choices=["teacher", "gt"],
+                        help="CE label source. 'teacher' = full-model argmax "
+                             "(default, maximises speculative acceptance). 'gt' = "
+                             "dataset ground-truth next token (input_ids), so the "
+                             "adapter learns the real answer directly. Requires "
+                             "input_ids in the .ckpt (saved by generate_training_data*).")
     parser.add_argument("--prefix_ce_start", type=int, default=1,
                         help="Offset inside supervised answer positions for prefix CE. "
                              "Use 1 for speculative decoding because the first answer token is "
@@ -192,6 +199,20 @@ class AdapterDataset(Dataset):
         if orig_len > 1:
             loss_mask_shifted[:orig_len - 1] = loss_mask[1:orig_len].float()
 
+        # GT labels for direct-supervision CE: hidden_state at position i predicts
+        # the token at position i+1, so the label at position i is input_ids[i+1].
+        # Shift left by one to stay aligned with loss_mask_shifted; the trailing
+        # slot is -100 (ignored by F.cross_entropy and never selected because
+        # loss_mask is 0 there). Only used when --ce_target gt.
+        input_ids = data.get("input_ids")
+        if input_ids is not None:
+            gt_labels = torch.full((orig_len,), -100, dtype=torch.long)
+            if orig_len > 1:
+                gt_labels[:orig_len - 1] = input_ids[1:orig_len].long()
+            gt_labels = gt_labels.tolist()
+        else:
+            gt_labels = None
+
         length = hidden_state.shape[1]
         attention_mask = [1] * length
 
@@ -204,6 +225,7 @@ class AdapterDataset(Dataset):
         return {
             "attention_mask": attention_mask,
             "loss_mask": loss_mask_shifted.tolist(),
+            "gt_labels": gt_labels,
             "target": hidden_state,
             "hidden_state_big": hidden_state,
             "hidden_state_early": hidden_state_early,
@@ -236,6 +258,14 @@ class DataCollatorWithPadding:
             "loss_mask": torch.tensor([item["loss_mask"] + [0] * (max_length - len(item["loss_mask"])) for item in features]),
             "attention_mask": torch.tensor([item["attention_mask"] + [0] * (max_length - len(item["attention_mask"])) for item in features]),
         }
+        # Stack GT labels (-100 padded) if every sample carries them.
+        if all(item.get("gt_labels") is not None for item in features):
+            out["gt_labels"] = torch.tensor(
+                [item["gt_labels"] + [-100] * (max_length - len(item["gt_labels"])) for item in features],
+                dtype=torch.long,
+            )
+        else:
+            out["gt_labels"] = None
         # Stack 3D position_ids if all features have them; else None.
         if all(f.get("position_ids") is not None for f in features):
             pos_padded = [self.padding_position_ids(f["position_ids"], max_length) for f in features]
@@ -270,6 +300,7 @@ def save_adapter(model, adapter_config, args, accelerator, tag):
             "prefix_ce_weight": args.prefix_ce_weight,
             "prefix_ce_start": args.prefix_ce_start,
             "prefix_ce_decay": args.prefix_ce_decay,
+            "ce_target": args.ce_target,
         },
     }
     with open(os.path.join(save_dir, "adapter_config.json"), "w") as f:
@@ -367,13 +398,20 @@ def compute_prefix_argmax_ce(
     prefix_tokens,
     prefix_start=0,
     prefix_decay=1.0,
+    gt_labels=None,
 ):
     """Memory-efficient prefix CE: only compute CE at the weighted positions.
 
     The full [B, L] CE matrix can be tens of GB for big vocabulary + long
     sequences; instead we build the per-segment prefix-weight mask first,
-    gather just the positions where the weight > 0, and compute argmax + CE
-    only there.
+    gather just the positions where the weight > 0, and compute CE only there.
+
+    Label source:
+      - gt_labels is None  -> teacher-argmax CE (fit the verify model's output;
+                              maximises speculative acceptance rate).
+      - gt_labels given     -> ground-truth CE (fit the dataset's real next
+                              token). gt_labels: [B, L] long, already shifted so
+                              position i holds input_ids[i+1], -100 elsewhere.
     """
     prefix_weights = build_prefix_weight_mask(
         loss_mask.squeeze(-1) if loss_mask.dim() == 3 else loss_mask,
@@ -387,8 +425,11 @@ def compute_prefix_argmax_ce(
     if out_flat.shape[0] == 0:
         return out_head.sum() * 0.0
 
-    tgt_flat = target_head[sel]                       # [N, V]
-    labels = tgt_flat.argmax(dim=-1).detach()         # [N]
+    if gt_labels is not None:
+        labels = gt_labels.to(out_flat.device)[sel].long()  # [N] real next tokens
+    else:
+        tgt_flat = target_head[sel]                   # [N, V]
+        labels = tgt_flat.argmax(dim=-1).detach()     # [N] teacher argmax
     w_flat = prefix_weights[sel]                      # [N]
 
     per_token_ce = F.cross_entropy(out_flat, labels, reduction="none")  # [N]
@@ -552,6 +593,7 @@ def evaluate_on_loader(model, head, val_loader, accelerator, args):
             prefix_tokens=args.prefix_ce_tokens,
             prefix_start=args.prefix_ce_start,
             prefix_decay=args.prefix_ce_decay,
+            gt_labels=data.get("gt_labels") if args.ce_target == "gt" else None,
         )
         loss = args.kl_weight * kl_loss + args.prefix_ce_weight * prefix_ce_loss
         dist_overlap = (data["loss_mask"] * prob_acc_per_token).sum() / data["loss_mask"].sum().clamp(min=1)
@@ -793,7 +835,8 @@ def main():
         print(
             f"Loss: KL(T={args.kl_temperature})"
             f" + {args.prefix_ce_weight} * WeightedPrefixCE("
-            f"start={args.prefix_ce_start}, tokens={args.prefix_ce_tokens}, decay={args.prefix_ce_decay})"
+            f"target={args.ce_target}, start={args.prefix_ce_start}, "
+            f"tokens={args.prefix_ce_tokens}, decay={args.prefix_ce_decay})"
         )
 
     if args.start_epoch > 0 and not args.resume_adapter:
@@ -815,6 +858,12 @@ def main():
 
         for batch_idx, data in enumerate(tqdm(train_loader)):
             with accelerator.accumulate(model):
+                if args.ce_target == "gt" and data.get("gt_labels") is None:
+                    raise ValueError(
+                        "--ce_target gt requires 'input_ids' in every .ckpt, but a "
+                        "batch had none. Regenerate data with generate_training_data*.py "
+                        "(it saves input_ids) or use --ce_target teacher."
+                    )
                 predict = model(
                     inputs_embeds=data["hidden_states_early"],
                     attention_mask=data["attention_mask"],
@@ -848,6 +897,7 @@ def main():
                     prefix_tokens=args.prefix_ce_tokens,
                     prefix_start=args.prefix_ce_start,
                     prefix_decay=args.prefix_ce_decay,
+                    gt_labels=data.get("gt_labels") if args.ce_target == "gt" else None,
                 )
                 loss = args.kl_weight * kl_loss + args.prefix_ce_weight * prefix_ce_loss
 
