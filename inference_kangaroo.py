@@ -304,14 +304,16 @@ def kangaroo_speculative_generate(
             )
 
             predict_logits = head_model(hidden_state[:, -1:, :]).float()
-            # Apply repetition penalty over tokens generated so far IN THIS TURN
-            # (excludes the prompt). Same prefix/penalty/eos as the verify and
-            # AR sides → spec lossless to "AR with same penalty" is preserved.
+            # Apply repetition penalty over the FULL sequence so far (prompt +
+            # history + this turn's generated tokens), matching HF's
+            # RepetitionPenaltyLogitsProcessor exactly. Do NOT protect EOS —
+            # HF doesn't either; protecting it makes spec output longer than
+            # MMDuet2's base output.
             draft_pos_logits = predict_logits[:, -1, :]
             if repetition_penalty != 1.0:
-                draft_prefix = global_tokens[0, context_length:end_index]
+                draft_prefix = global_tokens[0, :end_index]
                 draft_pos_logits = apply_repetition_penalty(
-                    draft_pos_logits, draft_prefix, repetition_penalty, token_eos_set,
+                    draft_pos_logits, draft_prefix, repetition_penalty, None,
                 )
             predicted_token = torch.argmax(draft_pos_logits, dim=-1)
 
@@ -358,15 +360,15 @@ def kangaroo_speculative_generate(
         verify_logits = head_model(hidden_state_normed).float()
         if repetition_penalty != 1.0:
             # Each verify position i predicts token at start_index+1+i. Its
-            # prefix (this-turn generated so far) is global_tokens[context_length
-            # : start_index+1+i]. Apply per-position to match HF's per-step
-            # advancing prefix, so spec stays lossless to AR.
+            # prefix is the FULL sequence so far global_tokens[: start_index+1+i]
+            # (prompt + history + generated). Matches HF's per-step advancing
+            # prefix exactly; do NOT protect EOS.
             verify_ids = []
             for j in range(verify_logits.shape[1]):
                 pos_logits = verify_logits[:, j, :]
-                pos_prefix = global_tokens[0, context_length:start_index + 1 + j]
+                pos_prefix = global_tokens[0, :start_index + 1 + j]
                 pos_logits = apply_repetition_penalty(
-                    pos_logits, pos_prefix, repetition_penalty, token_eos_set,
+                    pos_logits, pos_prefix, repetition_penalty, None,
                 )
                 verify_ids.append(int(torch.argmax(pos_logits, dim=-1).item()))
         else:

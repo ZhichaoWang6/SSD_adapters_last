@@ -138,14 +138,16 @@ def autoregressive_manual_baseline(
             in_features_large=draft_hidden,
         )
 
-        # Logits → next token (with optional repetition penalty over this
-        # turn's generated tokens, matching the spec / draft paths).
+        # Logits → next token with optional repetition penalty over the FULL
+        # sequence so far (prompt + history + generated), matching HF's
+        # RepetitionPenaltyLogitsProcessor exactly. Do NOT protect EOS.
         logits = head_model(hidden_normed).float()
         pos_logits = logits[:, -1, :]
         if repetition_penalty != 1.0:
-            prefix = torch.tensor(generated_tokens, device=device, dtype=torch.long)
+            gen_t = torch.tensor(generated_tokens, device=device, dtype=torch.long)
+            prefix = torch.cat([input_ids[0], gen_t], dim=0)
             pos_logits = apply_repetition_penalty(
-                pos_logits, prefix, repetition_penalty, token_eos_set,
+                pos_logits, prefix, repetition_penalty, None,
             )
         next_token_id = torch.argmax(pos_logits, dim=-1).item()
         generated_tokens.append(next_token_id)
