@@ -65,6 +65,11 @@ def parse_args():
                         help="Optional prefix to strip from image paths before joining image_root")
     parser.add_argument("--strip_ego_time_suffix", action="store_true",
                         help="Map frame folders like videoid-0s_180s to videoid")
+    parser.add_argument("--renumber_frames_sequential", action="store_true",
+                        help="Rewrite each frame filename to its 1-based position in the "
+                             "example's image list (1,2,3,...) instead of the source's "
+                             "original video frame indices (1,3,5,...). Use ONLY if the "
+                             "subsampled frames on disk are stored consecutively.")
     parser.add_argument("--device", type=str, default="cuda:6")
     parser.add_argument("--start", type=int, default=0)
     parser.add_argument("--end", type=int, default=None)
@@ -115,21 +120,43 @@ def get_question_id(example, index):
     )
 
 
-def image_paths(example, image_root, strip_prefix, strip_ego_time_suffix):
+def renumber_frame_path(path, seq_num):
+    """Rewrite the numeric filename to its 1-based position in the image list,
+    preserving directory, extension and zero-pad width.
+    e.g. ".../000003.jpg", seq_num=2 -> ".../000002.jpg".
+    Use only when frames on disk are stored consecutively (1,2,3,...) rather
+    than with the source's original video frame indices (1,3,5,...)."""
+    if path is None:
+        return None
+    d = os.path.dirname(path)
+    base = os.path.basename(path)
+    m = re.match(r"^(\d+)(\.\w+)$", base)
+    if not m:
+        return path
+    width = len(m.group(1))
+    ext = m.group(2)
+    return os.path.join(d, f"{seq_num:0{width}d}{ext}")
+
+
+def image_paths(example, image_root, strip_prefix, strip_ego_time_suffix,
+                renumber_sequential=False):
     paths = []
-    for item in example.get("images", []):
+    for idx, item in enumerate(example.get("images", [])):
         if isinstance(item, str):
             path = item
         elif isinstance(item, dict):
             path = item.get("path") or item.get("image")
         else:
             continue
-        paths.append(resolve_image_path(
+        resolved = resolve_image_path(
             path,
             image_root=image_root,
             strip_prefix=strip_prefix,
             strip_ego_time_suffix=strip_ego_time_suffix,
-        ))
+        )
+        if renumber_sequential:
+            resolved = renumber_frame_path(resolved, idx + 1)
+        paths.append(resolved)
     return paths
 
 
@@ -156,12 +183,14 @@ def convert_user_content(content, paths, cursor):
     return parts, cursor
 
 
-def convert_messages_to_prompt(example, index, image_root, strip_prefix, strip_ego_time_suffix=False):
+def convert_messages_to_prompt(example, index, image_root, strip_prefix,
+                               strip_ego_time_suffix=False, renumber_sequential=False):
     paths = image_paths(
         example,
         image_root=image_root,
         strip_prefix=strip_prefix,
         strip_ego_time_suffix=strip_ego_time_suffix,
+        renumber_sequential=renumber_sequential,
     )
     cursor = 0
     converted = []
@@ -308,6 +337,7 @@ def main():
                     image_root=args.image_root,
                     strip_prefix=args.strip_prefix,
                     strip_ego_time_suffix=args.strip_ego_time_suffix,
+                    renumber_sequential=args.renumber_frames_sequential,
                 )
                 if args.prompt_only:
                     conversation = build_prompt_only_conversation(converted)

@@ -24,3 +24,9 @@ python -u generate_streaming_ar_from_sft.py \
     # Add --strip_ego_time_suffix ONLY if your frame folders are named
     # <video_id> WITHOUT the "-0s_180s" time suffix. If the folders on disk
     # literally contain "-0s_180s", do NOT add it.
+    #
+    # Add --renumber_frames_sequential ONLY if the subsampled frames on disk
+    # are stored consecutively (000001, 000002, 000003, ...) rather than with
+    # the source's original video frame indices (000001, 000003, 000005, ...).
+    # It rewrites each filename to its 1-based position in the image list.
+    # ls the frame folder first to check which layout you have.
