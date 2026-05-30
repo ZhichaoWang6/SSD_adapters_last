@@ -247,6 +247,8 @@ def kangaroo_speculative_generate(
         stats['first_token_disagree_with_base'] = first_token_disagree
         stats['first_token_id'] = int(first_token.item())
         stats['base_first_token_id'] = int(base_first_token.item())
+        stats['first_token_str'] = tokenizer.decode([int(first_token.item())])
+        stats['base_first_token_str'] = tokenizer.decode([int(base_first_token.item())])
         return output_ids, base_model.past_key_values, stats
 
     # ========== Draft-Verify Loop ==========
@@ -508,6 +510,8 @@ def kangaroo_speculative_generate(
     stats['first_token_disagree_with_base'] = first_token_disagree
     stats['first_token_id'] = int(first_token.item())
     stats['base_first_token_id'] = int(base_first_token.item())
+    stats['first_token_str'] = tokenizer.decode([int(first_token.item())])
+    stats['base_first_token_str'] = tokenizer.decode([int(base_first_token.item())])
     stats['draft_accept_per_round'] = draft_accept_per_round
     #==============================================================================================================
 

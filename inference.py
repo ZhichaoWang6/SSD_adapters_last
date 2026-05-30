@@ -437,7 +437,18 @@ def _metrics(turn_stats):
             'steps': len(al),
             'accept_lengths': al,
             'rounds': rounds_detail,
+            # First-token probe (only meaningful when --adapter_first_token):
+            'first_token_used_adapter': s.get('first_token_used_adapter', False),
+            'first_token_disagree': s.get('first_token_disagree_with_base', False),
+            'first_token_str': s.get('first_token_str', ''),
+            'base_first_token_str': s.get('base_first_token_str', ''),
         })
+
+    # First-token disagreement aggregate
+    first_token_disagree_n = sum(
+        1 for s in spec if s.get('first_token_disagree_with_base', False)
+    )
+    used_adapter_first = any(s.get('first_token_used_adapter', False) for s in spec)
 
     return {
         'turns': len(spec),
@@ -465,6 +476,9 @@ def _metrics(turn_stats):
         'adapter_first_accuracy': _safe_div(adapter_first_correct, adapter_first_total),
         'avg_confidence': avg_confidence,
         'per_turn': per_turn,
+        'first_token_used_adapter': used_adapter_first,
+        'first_token_disagree_count': first_token_disagree_n,
+        'first_token_disagree_rate': _safe_div(first_token_disagree_n, len(spec)),
     }
 
 
@@ -499,6 +513,13 @@ def _print_metrics(label, m):
         f"first={m['adapter_first_correct']}/{m['adapter_first_total']} "
         f"({m['adapter_first_accuracy']:.1%}) | conf={m['avg_confidence']:.3f}"
     )
+    if m.get('first_token_used_adapter'):
+        n = m['turns']
+        d = m['first_token_disagree_count']
+        print(
+            f"    first-token probe (adapter): disagree {d}/{n} "
+            f"({m['first_token_disagree_rate']:.1%}) vs base"
+        )
 
 
 def print_generation_summary(title, summary):
@@ -509,7 +530,13 @@ def print_generation_summary(title, summary):
     _print_metrics("Overall", summary)
     for turn_idx, t in enumerate(summary.get('per_turn', [])):
         round_speedup = [round(r['speedup'], 2) for r in t.get('rounds', [])]
-        print(f"  turn {turn_idx}: steps={t['steps']} | accept={t['accept_lengths']} | round_speedup={round_speedup}")
+        first_info = ""
+        if t.get('first_token_used_adapter'):
+            ft = t.get('first_token_str', '').replace('\n', '\\n')
+            bt = t.get('base_first_token_str', '').replace('\n', '\\n')
+            tag = "DISAGREE" if t.get('first_token_disagree') else "agree"
+            first_info = f" | first: adapter='{ft}' base='{bt}' ({tag})"
+        print(f"  turn {turn_idx}: steps={t['steps']} | accept={t['accept_lengths']} | round_speedup={round_speedup}{first_info}")
     for label, key in (('Short/NO_REPLY <=5 tok', 'short_reply'), ('Long >5 tok', 'long_reply')):
         bucket = summary.get(key)
         if bucket and bucket['turns']:
