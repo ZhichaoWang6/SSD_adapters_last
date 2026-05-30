@@ -39,6 +39,11 @@ def parse_args():
     parser.add_argument("--repetition_penalty", type=float, default=None,
                         help="logits 上的重复惩罚，spec/AR/draft 三处统一套，仍 lossless。"
                              "不传则从 model.generation_config 读，读不到则 1.0（关闭）。")
+    parser.add_argument("--adapter_first_token", action="store_true",
+                        help="Use adapter's prediction for the first token of each turn "
+                             "(i.e. the 'should I respond' decision) instead of base "
+                             "prefill's argmax. Spec output is no longer lossless to base "
+                             "when enabled; probe of adapter's standalone trigger capability.")
     parser.add_argument("--device", type=str, default="cuda:4")
 
     # generation args
@@ -122,7 +127,9 @@ class ProactiveInferenceClient:
             self.eos_token_ids = list(tok_eos) if isinstance(tok_eos, (list, tuple, set)) else (
                 [int(tok_eos)] if tok_eos is not None else None
             )
-        logger.info(f"repetition_penalty={self.repetition_penalty}, eos_token_ids={self.eos_token_ids}")
+        self.adapter_first_token = bool(getattr(args, 'adapter_first_token', False))
+        logger.info(f"repetition_penalty={self.repetition_penalty}, eos_token_ids={self.eos_token_ids}, "
+                    f"adapter_first_token={self.adapter_first_token}")
 
         self.history = list()
         self.prev_frame_before_token_drop = None    # for dynamic token drop
@@ -249,6 +256,7 @@ class ProactiveInferenceClient:
                 threshold=self.speculative_threshold,
                 repetition_penalty=self.repetition_penalty,
                 eos_token_ids=self.eos_token_ids,
+                adapter_first_token=self.adapter_first_token,
             )
             spec_stats["context_len"] = context_len
             combined_stats = {'speculative': spec_stats}

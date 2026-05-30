@@ -91,6 +91,7 @@ def kangaroo_speculative_generate(
     past_key_values=None,
     repetition_penalty: float = 1.0,
     eos_token_ids=None,
+    adapter_first_token: bool = False,
 ):
     # =======================
     adapter_correct = 0
@@ -177,8 +178,10 @@ def kangaroo_speculative_generate(
     output = base_model.model(**forward_kwargs)
     base_model.past_key_values = output.past_key_values
 
-    first_token = torch.argmax(output.logits[:, -1, :], dim=-1)
-    global_tokens[:, start_index] = first_token.item()
+    # Base's first-token argmax (always computed; used as baseline for
+    # disagreement logging, and as the actual first token when
+    # adapter_first_token=False).
+    base_first_token = torch.argmax(output.logits[:, -1, :], dim=-1)
 
     hidden_state_early = output.hidden_states[early_exit_layer]
 
@@ -199,11 +202,33 @@ def kangaroo_speculative_generate(
 
 
 
-    _, adapter_past_key_values = adapter_model.forward_early_stop(
+    adapter_hidden_prefill, adapter_past_key_values = adapter_model.forward_early_stop(
         inputs_embeds=hidden_state_early,
         position_ids=prefill_position_ids,
         use_cache=True,
     )
+
+    # Choose source of the very first generated token:
+    #   - adapter_first_token=False (default): use base's prefill argmax (lossless probe)
+    #   - adapter_first_token=True : use adapter's prediction at the last prefill
+    #     position. This is for testing the adapter's standalone "should I
+    #     respond now?" capability — when adapter disagrees with base, the
+    #     output is no longer lossless to base, but you can read off the
+    #     adapter's trigger behavior directly (e.g. how often it picks NO).
+    if adapter_first_token:
+        adapter_first_logits = head_model(adapter_hidden_prefill[:, -1:, :]).float()
+        first_pos_logits = adapter_first_logits[:, 0, :]
+        if repetition_penalty != 1.0:
+            adapter_first_prefix = inputs['input_ids'][0]
+            first_pos_logits = apply_repetition_penalty(
+                first_pos_logits, adapter_first_prefix, repetition_penalty, None,
+            )
+        first_token = torch.argmax(first_pos_logits, dim=-1)
+    else:
+        first_token = base_first_token
+
+    global_tokens[:, start_index] = first_token.item()
+    first_token_disagree = (first_token.item() != base_first_token.item())
 
     torch.cuda.synchronize() if torch.cuda.is_available() else None
     prefill_time = time.perf_counter() - t_prefill_start
@@ -218,6 +243,10 @@ def kangaroo_speculative_generate(
         torch.cuda.synchronize() if torch.cuda.is_available() else None
         total_time = time.perf_counter() - t_start
         stats = _build_stats([], prefill_time, [], [], total_time, 1)
+        stats['first_token_used_adapter'] = adapter_first_token
+        stats['first_token_disagree_with_base'] = first_token_disagree
+        stats['first_token_id'] = int(first_token.item())
+        stats['base_first_token_id'] = int(base_first_token.item())
         return output_ids, base_model.past_key_values, stats
 
     # ========== Draft-Verify Loop ==========
@@ -475,6 +504,10 @@ def kangaroo_speculative_generate(
     stats['adapter_first_total'] = adapter_first_total
     stats['adapter_avg_confidence'] = avg_confidence
     stats['progress_per_round'] = stats['avg_accept_length']
+    stats['first_token_used_adapter'] = adapter_first_token
+    stats['first_token_disagree_with_base'] = first_token_disagree
+    stats['first_token_id'] = int(first_token.item())
+    stats['base_first_token_id'] = int(base_first_token.item())
     stats['draft_accept_per_round'] = draft_accept_per_round
     #==============================================================================================================
 
@@ -492,6 +525,7 @@ def speculative_generate_for_streaming(
     threshold: float = 0.6,
     repetition_penalty: float = 1.0,
     eos_token_ids=None,
+    adapter_first_token: bool = False,
 ):
     output_ids, past_key_values, stats = kangaroo_speculative_generate(
         model=model,
@@ -505,6 +539,7 @@ def speculative_generate_for_streaming(
         past_key_values=past_key_values,
         repetition_penalty=repetition_penalty,
         eos_token_ids=eos_token_ids,
+        adapter_first_token=adapter_first_token,
     )
     # print(f"Speculative generation completed. Stats: {stats}")
 
