@@ -45,7 +45,16 @@ def parse_args():
     p = argparse.ArgumentParser(description="Offline trigger (NO REPLY vs respond) evaluation")
     p.add_argument("--basepath", required=True, help="Base MMDuet2 ckpt (for lm_head + config + tokenizer)")
     p.add_argument("--datadir", required=True, help="Dir of .ckpt training files")
-    p.add_argument("--adapter_path", required=True, help="Dir with adapter_model.bin + adapter_config.json")
+    p.add_argument("--source", choices=["adapter", "base"], default="adapter",
+                   help="Whose trigger decision to evaluate. 'adapter' = early-exit "
+                        "hidden_state_layer{N} through the adapter (the deployed gate). "
+                        "'base' = the full model's final hidden_state through lm_head "
+                        "(the reference: how well the base model itself triggers). Same "
+                        "split / NO-token / miss-FA accounting, so the two are directly "
+                        "comparable.")
+    p.add_argument("--adapter_path", default=None,
+                   help="Dir with adapter_model.bin + adapter_config.json. Required for "
+                        "--source adapter; ignored for --source base.")
     p.add_argument("--exit_layer", type=int, default=4)
     p.add_argument("--num_adapter_layers", type=int, default=3)
     p.add_argument("--val_ratio", type=float, default=0.05)
@@ -131,10 +140,15 @@ def main():
     cfg = AutoConfig.from_pretrained(args.basepath)
     tok = AutoTokenizer.from_pretrained(args.basepath)
     head = load_lm_head(args.basepath, cfg.hidden_size, cfg.vocab_size, dtype).to(device)
-    adapter = load_adapter(args.basepath, args.adapter_path, args.num_adapter_layers, dtype).to(device)
+    if args.source == "adapter":
+        if args.adapter_path is None:
+            raise ValueError("--source adapter requires --adapter_path")
+        adapter = load_adapter(args.basepath, args.adapter_path, args.num_adapter_layers, dtype).to(device)
+    else:
+        adapter = None
 
     files = split_files(args.datadir, args.val_ratio, args.val_seed, args.eval_split)
-    print(f"Evaluating {len(files)} ckpt(s) [{args.eval_split} split]")
+    print(f"Evaluating {len(files)} ckpt(s) [{args.eval_split} split] | source={args.source}")
     norm_no_reply = args.no_reply_text.strip()
 
     # The "NO REPLY" first-token id. Use the override if given, else the
@@ -151,16 +165,22 @@ def main():
 
     for fp in files:
         d = torch.load(fp, map_location="cpu", weights_only=False)
-        if layer_key not in d:
-            raise KeyError(f"{fp} has no {layer_key}; regenerate with --exit_layers {args.exit_layer}")
         input_ids = d["input_ids"]
         loss_mask = d["loss_mask"]
-        early = d[layer_key].unsqueeze(0).to(device, dtype)  # (1, L, D)
-        pos_ids = d.get("position_ids")
-        if pos_ids is not None:
-            pos_ids = pos_ids[:, None, :].to(device)  # (3, 1, L)
-
-        hidden = adapter(inputs_embeds=early, position_ids=pos_ids)  # (1, L, D)
+        if args.source == "adapter":
+            if layer_key not in d:
+                raise KeyError(f"{fp} has no {layer_key}; regenerate with --exit_layers {args.exit_layer}")
+            early = d[layer_key].unsqueeze(0).to(device, dtype)  # (1, L, D)
+            pos_ids = d.get("position_ids")
+            if pos_ids is not None:
+                pos_ids = pos_ids[:, None, :].to(device)  # (3, 1, L)
+            hidden = adapter(inputs_embeds=early, position_ids=pos_ids)  # (1, L, D)
+        else:
+            # base reference: the full model's final hidden state -> lm_head is
+            # exactly the base model's own next-token (trigger) prediction.
+            if "hidden_state" not in d:
+                raise KeyError(f"{fp} has no 'hidden_state' (final layer)")
+            hidden = d["hidden_state"].unsqueeze(0).to(device, dtype)  # (1, L, D)
 
         segments = find_segments(loss_mask)
         trig_positions, gt_no_reply_flags, seg_starts = [], [], []
@@ -254,7 +274,7 @@ def main():
     out = {
         "n_turns": n_total, "gt_respond": n_gt_respond, "gt_no_reply": n_gt_no,
         "no_first_token": no_first_token, "eval_split": args.eval_split,
-        "adapter_path": args.adapter_path,
+        "source": args.source, "adapter_path": args.adapter_path,
         "results": {k: {kk: vv for kk, vv in v.items()} for k, v in results.items()},
     }
     with open(args.output_json, "w") as f:
