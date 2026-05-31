@@ -62,6 +62,18 @@ def parse_args():
                              "dataset ground-truth next token (input_ids), so the "
                              "adapter learns the real answer directly. Requires "
                              "input_ids in the .ckpt (saved by generate_training_data*).")
+    parser.add_argument("--gate_head", action="store_true",
+                        help="Add a binary proactive-response gate head (Linear(D,1)) trained "
+                             "with BCE+pos_weight on per-turn trigger positions. Separate from "
+                             "the lm_head CE path; lets the adapter decide NO REPLY vs respond.")
+    parser.add_argument("--gate_weight", type=float, default=1.0,
+                        help="Weight of the gate BCE loss added to the total loss.")
+    parser.add_argument("--gate_pos_weight", type=float, default=0.0,
+                        help="BCE pos_weight for the respond class. 0 = auto (neg/pos ratio "
+                             "computed per batch). Set e.g. 6.0 to fix it.")
+    parser.add_argument("--gate_no_first_token", type=int, default=8996,
+                        help="First token id of 'NO REPLY' (Qwen2.5-VL 'NO'=8996). A turn is "
+                             "NO REPLY iff its first token equals this.")
     parser.add_argument("--prefix_ce_start", type=int, default=1,
                         help="Offset inside supervised answer positions for prefix CE. "
                              "Use 1 for speculative decoding because the first answer token is "
@@ -180,12 +192,26 @@ def filter_by_sample_metadata(
 
 
 class AdapterDataset(Dataset):
-    def __init__(self, datapath, exit_layer):
+    def __init__(self, datapath, exit_layer, gate_head=False, gate_no_first_token=8996):
         self.data = datapath
         self.exit_layer = exit_layer
+        self.gate_head = gate_head
+        # First token id of "NO REPLY" (Qwen2.5-VL: 'NO' == 8996). A turn is
+        # treated as NO REPLY iff its first token equals this. Configurable.
+        self.gate_no_first_token = gate_no_first_token
 
     def __len__(self):
         return len(self.data)
+
+    @staticmethod
+    def _segments(loss_mask):
+        """Contiguous runs where loss_mask > 0 -> list of (start, end_exclusive)."""
+        pos = (loss_mask > 0).to(torch.int8)
+        padded = torch.cat([torch.zeros(1, dtype=torch.int8), pos, torch.zeros(1, dtype=torch.int8)])
+        diff = padded[1:] - padded[:-1]
+        starts = torch.nonzero(diff == 1).flatten().tolist()
+        ends = torch.nonzero(diff == -1).flatten().tolist()
+        return list(zip(starts, ends))
 
     def __getitem__(self, index):
         data = torch.load(self.data[index], map_location="cpu", weights_only=False)
@@ -213,6 +239,26 @@ class AdapterDataset(Dataset):
         else:
             gt_labels = None
 
+        # Gate labels: one supervised position per assistant turn, at the
+        # TRIGGER position s-1 (the adapter output there predicts the turn's
+        # first token). Label 1=respond, 0=NO REPLY (first token == NO id).
+        # gate_label is -100 elsewhere; gate_mask marks the supervised slots.
+        gate_label = None
+        gate_mask = None
+        if self.gate_head:
+            gate_label = torch.full((orig_len,), -100.0, dtype=torch.float32)
+            gate_mask = torch.zeros(orig_len, dtype=torch.float32)
+            if input_ids is None:
+                raise ValueError("gate_head needs input_ids in the .ckpt to derive trigger labels")
+            for s, e in self._segments(loss_mask):
+                if s == 0:
+                    continue
+                is_respond = 0.0 if int(input_ids[s].item()) == self.gate_no_first_token else 1.0
+                gate_label[s - 1] = is_respond
+                gate_mask[s - 1] = 1.0
+            gate_label = gate_label.tolist()
+            gate_mask = gate_mask.tolist()
+
         length = hidden_state.shape[1]
         attention_mask = [1] * length
 
@@ -226,6 +272,8 @@ class AdapterDataset(Dataset):
             "attention_mask": attention_mask,
             "loss_mask": loss_mask_shifted.tolist(),
             "gt_labels": gt_labels,
+            "gate_label": gate_label,
+            "gate_mask": gate_mask,
             "target": hidden_state,
             "hidden_state_big": hidden_state,
             "hidden_state_early": hidden_state_early,
@@ -266,6 +314,19 @@ class DataCollatorWithPadding:
             )
         else:
             out["gt_labels"] = None
+        # Stack gate labels/masks (gate head) if every sample carries them.
+        if all(item.get("gate_label") is not None for item in features):
+            out["gate_label"] = torch.tensor(
+                [item["gate_label"] + [-100.0] * (max_length - len(item["gate_label"])) for item in features],
+                dtype=torch.float32,
+            )
+            out["gate_mask"] = torch.tensor(
+                [item["gate_mask"] + [0.0] * (max_length - len(item["gate_mask"])) for item in features],
+                dtype=torch.float32,
+            )
+        else:
+            out["gate_label"] = None
+            out["gate_mask"] = None
         # Stack 3D position_ids if all features have them; else None.
         if all(f.get("position_ids") is not None for f in features):
             pos_padded = [self.padding_position_ids(f["position_ids"], max_length) for f in features]
@@ -294,6 +355,8 @@ def save_adapter(model, adapter_config, args, accelerator, tag):
         "max_position_embeddings": adapter_config.max_position_embeddings,
         "exit_layer": args.exit_layer,
         "use_mlp": getattr(adapter_config, "use_mlp", True),
+        "gate_head": getattr(adapter_config, "gate_head", False),
+        "gate_no_first_token": args.gate_no_first_token,
         "loss": {
             "kl_temperature": args.kl_temperature,
             "prefix_ce_tokens": args.prefix_ce_tokens,
@@ -301,6 +364,8 @@ def save_adapter(model, adapter_config, args, accelerator, tag):
             "prefix_ce_start": args.prefix_ce_start,
             "prefix_ce_decay": args.prefix_ce_decay,
             "ce_target": args.ce_target,
+            "gate_weight": args.gate_weight if args.gate_head else 0.0,
+            "gate_pos_weight": args.gate_pos_weight,
         },
     }
     with open(os.path.join(save_dir, "adapter_config.json"), "w") as f:
@@ -436,6 +501,47 @@ def compute_prefix_argmax_ce(
     return (per_token_ce * w_flat).sum() / w_flat.sum().clamp_min(1.0)
 
 
+def compute_gate_loss(gate_logits, gate_label, gate_mask, pos_weight=0.0):
+    """BCE-with-logits on the supervised trigger positions only.
+
+    gate_logits: [B, L]  adapter gate head output.
+    gate_label:  [B, L]  1=respond, 0=NO REPLY, -100 elsewhere.
+    gate_mask:   [B, L]  1 at supervised trigger positions.
+    pos_weight:  >0 fixes the respond-class weight; 0 = auto (neg/pos in batch).
+
+    Returns (loss, logits_at_pos, labels_at_pos) — the latter two for AUC.
+    """
+    sel = gate_mask > 0
+    if sel.sum() == 0:
+        z = gate_logits.sum() * 0.0
+        return z, gate_logits.new_zeros(0), gate_logits.new_zeros(0)
+    logit_sel = gate_logits[sel]
+    label_sel = gate_label[sel].clamp(min=0.0)  # -100 can't appear under mask
+    if pos_weight and pos_weight > 0:
+        pw = torch.tensor(float(pos_weight), device=logit_sel.device)
+    else:
+        n_pos = label_sel.sum().clamp_min(1.0)
+        n_neg = (label_sel.numel() - label_sel.sum()).clamp_min(1.0)
+        pw = (n_neg / n_pos).detach()
+    loss = F.binary_cross_entropy_with_logits(logit_sel, label_sel, pos_weight=pw)
+    return loss, logit_sel.detach(), label_sel.detach()
+
+
+def gate_auc(logits, labels):
+    """ROC-AUC via Mann-Whitney U on (logits, binary labels). nan if one class."""
+    if logits.numel() == 0:
+        return float("nan")
+    order = torch.argsort(logits)
+    ranks = torch.empty_like(logits)
+    ranks[order] = torch.arange(1, logits.numel() + 1, device=logits.device, dtype=logits.dtype)
+    n_pos = labels.sum()
+    n_neg = labels.numel() - n_pos
+    if n_pos == 0 or n_neg == 0:
+        return float("nan")
+    sum_pos = ranks[labels > 0.5].sum()
+    return ((sum_pos - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg)).item()
+
+
 def empty_match_stats():
     keys = [
         "token_correct", "token_total",
@@ -567,6 +673,7 @@ def evaluate_on_loader(model, head, val_loader, accelerator, args):
     total_dist_overlap = 0.0
     n_batches = 0
     match_totals = empty_match_stats()
+    gate_logits_all, gate_labels_all = [], []
 
     for data in tqdm(val_loader, desc="[val]", leave=False):
         predict = model(
@@ -574,6 +681,11 @@ def evaluate_on_loader(model, head, val_loader, accelerator, args):
             attention_mask=data["attention_mask"],
             position_ids=data.get("position_ids"),
         )
+        if args.gate_head and data.get("gate_label") is not None:
+            gl = accelerator.unwrap_model(model).gate_logits(predict)
+            sel = data["gate_mask"] > 0
+            gate_logits_all.append(gl[sel].float().cpu())
+            gate_labels_all.append(data["gate_label"][sel].clamp(min=0.0).float().cpu())
         target_head = head(data["target"].float())
         out_head = head(predict.float())
         prob_exit = F.softmax(out_head, dim=2)
@@ -626,6 +738,19 @@ def evaluate_on_loader(model, head, val_loader, accelerator, args):
         'long_dconf':   match_conf(global_match, 'long_draft1', 'adapter'),
         'n_batches':    n_batches,
     }
+    if args.gate_head and gate_logits_all:
+        gl = torch.cat(gate_logits_all)
+        gy = torch.cat(gate_labels_all)
+        metrics['gate_auc'] = gate_auc(gl, gy)
+        # miss/false-alarm at p(respond)>=0.5 (logit>=0). positive=respond.
+        pred = (gl >= 0).float()
+        tp = ((pred == 1) & (gy == 1)).sum().item()
+        fn = ((pred == 0) & (gy == 1)).sum().item()
+        fp = ((pred == 1) & (gy == 0)).sum().item()
+        tn = ((pred == 0) & (gy == 0)).sum().item()
+        metrics['gate_miss'] = fn / (tp + fn) if (tp + fn) else 0.0
+        metrics['gate_false_alarm'] = fp / (fp + tn) if (fp + tn) else 0.0
+        metrics['gate_n'] = int(gy.numel())
     model.train()
     return metrics
 
@@ -751,7 +876,9 @@ def main():
               f" (val_ratio={args.val_ratio}, seed={args.val_seed}"
               f"{', subsample=' + str(args.val_subsample) if args.val_subsample else ''})")
 
-    traindataset = AdapterDataset(train_paths, args.exit_layer)
+    traindataset = AdapterDataset(train_paths, args.exit_layer,
+                                  gate_head=args.gate_head,
+                                  gate_no_first_token=args.gate_no_first_token)
 
     train_loader = DataLoader(
         traindataset,
@@ -767,7 +894,9 @@ def main():
     )
 
     if val_paths:
-        valdataset = AdapterDataset(val_paths, args.exit_layer)
+        valdataset = AdapterDataset(val_paths, args.exit_layer,
+                                    gate_head=args.gate_head,
+                                    gate_no_first_token=args.gate_no_first_token)
         val_loader = DataLoader(
             valdataset,
             batch_size=args.bs,
@@ -782,7 +911,8 @@ def main():
     if accelerator.is_main_process:
         os.makedirs(args.outdir, exist_ok=True)
 
-    adapter_config = create_adapter_config(args.basepath, num_adapter_layers=args.num_adapter_layers)
+    adapter_config = create_adapter_config(args.basepath, num_adapter_layers=args.num_adapter_layers,
+                                           gate_head=args.gate_head)
     adapter_config.use_mlp = not args.disable_adapter_mlp
     model = AdapterModel(adapter_config)
     if accelerator.is_main_process:
@@ -901,6 +1031,17 @@ def main():
                 )
                 loss = args.kl_weight * kl_loss + args.prefix_ce_weight * prefix_ce_loss
 
+                gate_loss = out_head.sum() * 0.0
+                if args.gate_head:
+                    if data.get("gate_label") is None:
+                        raise ValueError("--gate_head set but gate_label missing (need input_ids in ckpt)")
+                    gate_logits = accelerator.unwrap_model(model).gate_logits(predict)
+                    gate_loss, _, _ = compute_gate_loss(
+                        gate_logits, data["gate_label"], data["gate_mask"],
+                        pos_weight=args.gate_pos_weight,
+                    )
+                    loss = loss + args.gate_weight * gate_loss
+
                 dist_overlap = torch.sum(data["loss_mask"] * prob_acc_per_token) / data["loss_mask"].sum().clamp(min=1)
 
                 with torch.no_grad():
@@ -935,6 +1076,7 @@ def main():
                         f"\tLoss: {loss.item():.4f}"
                         f"\tKL: {kl_loss.item():.4f}"
                         f"\tWPrefixCE: {prefix_ce_loss.item():.4f}"
+                        f"\tGate: {gate_loss.item():.4f}"
                         f"\tTop1: {match_acc(batch_stats, 'token'):.4f}"
                         f"\tFirst: {match_acc(batch_stats, 'first'):.4f}"
                         f"\tDraft1: {match_acc(batch_stats, 'draft1'):.4f}"
@@ -1028,6 +1170,14 @@ def main():
                     f"  LongDConf: {val_metrics['long_dconf']:.4f}"
                     f"  DistOverlap: {val_metrics['dist_overlap']:.4f}"
                 )
+                if 'gate_auc' in val_metrics:
+                    print(
+                        f"Gate  [{epoch + 1}/{args.num_epochs}]"
+                        f"  AUC: {val_metrics['gate_auc']:.4f}"
+                        f"  miss@0.5: {val_metrics['gate_miss']:.4f}"
+                        f"  falseAlarm@0.5: {val_metrics['gate_false_alarm']:.4f}"
+                        f"  n: {val_metrics['gate_n']}"
+                    )
             if nan_detected:
                 print("  Some NaN batches were skipped")
 
@@ -1047,6 +1197,9 @@ def main():
                 tag_overlap = epoch_dist_overlap
                 tag_loss = epoch_loss
 
+            gate_tag = ""
+            if val_metrics is not None and 'gate_auc' in val_metrics:
+                gate_tag = f"_gateauc{val_metrics['gate_auc']:.4f}_gatemiss{val_metrics['gate_miss']:.4f}"
             epoch_tag = (
                 f"epochs/"
                 f"epoch{epoch:03d}"
@@ -1055,6 +1208,7 @@ def main():
                 f"_{tag_prefix}longdraft1{tag_long_draft1:.4f}"
                 f"_{tag_prefix}overlap{tag_overlap:.4f}"
                 f"_{tag_prefix}loss{tag_loss:.4f}"
+                f"{gate_tag}"
             )
             save_adapter(model, adapter_config, args, accelerator, epoch_tag)
 

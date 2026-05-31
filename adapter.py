@@ -293,6 +293,16 @@ class AdapterModel(nn.Module):
             [AdapterDecoderLayer(config) for _ in range(self.num_adapter_layers)]
         )  # N 层解码层 (TwigVLM-style stack)
 
+        # Optional binary gate head for the proactive-response trigger. When
+        # enabled, it reads the adapter's normed output at a position and emits a
+        # single logit = "should respond here?" (sigmoid -> p(respond)). This is
+        # a dedicated 2-class objective (BCE + pos_weight), separate from the
+        # lm_head next-token path used for lossless speculative drafting, so the
+        # trigger decision is not drowned in the 150k-way vocab CE.
+        self.use_gate_head = getattr(config, 'gate_head', False)
+        if self.use_gate_head:
+            self.gate_head = nn.Linear(config.hidden_size, 1, bias=True)
+
     def _prepare_decoder_attention_mask(self, attention_mask, input_shape, inputs_embeds, past_key_values_length):
         combined_attention_mask = None
         dtype = inputs_embeds.dtype  # 跟随输入dtype，不写死float32
@@ -402,13 +412,24 @@ class AdapterModel(nn.Module):
             return hidden_states, next_decoder_cache
         return hidden_states
 
+    def gate_logits(self, hidden_states):
+        """Per-position gate logit from already-normed adapter output.
 
-def create_adapter_config(base_model_path, num_adapter_layers: int = 1):
+        hidden_states: (B, L, D) = the return of forward_early_stop / forward.
+        Returns (B, L) logits. sigmoid(logit) = p(respond at this position).
+        """
+        if not self.use_gate_head:
+            raise RuntimeError("gate_head is disabled; set config.gate_head=True")
+        return self.gate_head(hidden_states).squeeze(-1)
+
+
+def create_adapter_config(base_model_path, num_adapter_layers: int = 1, gate_head: bool = False):
     """Create adapter config from base model config.
 
     Args:
         base_model_path: Path to the base Qwen2.5-VL checkpoint.
         num_adapter_layers: Number of stacked decoder layers in the adapter.
+        gate_head: Add a binary proactive-response gate head (Linear(D,1)).
     """
     base_config = AutoConfig.from_pretrained(base_model_path)
     # Read mrope_section from base config's rope_scaling.
@@ -430,6 +451,7 @@ def create_adapter_config(base_model_path, num_adapter_layers: int = 1):
     # a custom attribute after construction so AdapterAttention can read it.
     adapter_config.mrope_section = mrope_section
     adapter_config.num_adapter_layers = num_adapter_layers
+    adapter_config.gate_head = gate_head
     return adapter_config
 
 
