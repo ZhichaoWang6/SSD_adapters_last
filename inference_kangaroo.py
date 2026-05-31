@@ -352,21 +352,18 @@ def kangaroo_speculative_generate(
 
             # New first token = base's argmax AFTER must_reply.
             #
-            # Even with "I must reply." injected, on this checkpoint the base
-            # often still picks "NO" first — visual evidence outweighs the
-            # text-only instruction. Since the gate just said "respond", we
-            # commit: mask the NO-REPLY first token id(s) to -inf so base is
-            # physically unable to start a NO REPLY sequence. Forces a real
-            # content first token; subsequent positions follow naturally.
+            # We do NOT hard-mask the NO-REPLY first token here. Masking forced
+            # the base to "speak" on frames it wanted to stay silent on, turning
+            # gate false-alarms into garbage output and breaking losslessness.
+            # Instead we let the base pick freely: if it still chooses NO REPLY
+            # after the must_reply nudge, that is its honest decision and stays
+            # lossless.
             new_first_logits = mr_output.logits[:, -1, :].float()
             if repetition_penalty != 1.0:
                 new_first_logits = apply_repetition_penalty(
                     new_first_logits, new_input_ids[0], repetition_penalty, None,
                 )
             blocked_first_token_id = None
-            if no_reply_token_ids:
-                blocked_first_token_id = int(no_reply_token_ids[0])
-                new_first_logits[..., blocked_first_token_id] = float('-inf')
             new_first_token = torch.argmax(new_first_logits, dim=-1)
 
             # Replace global_tokens with a bigger buffer that includes must_reply
