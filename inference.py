@@ -323,8 +323,9 @@ class ProactiveInferenceClient:
  
             if not output_match:
                 print("WARNING: Outputs differ! Speculative decoding is NOT lossless.")
-                print("Using AR output for conversation history to avoid contaminating later turns.")
-                history_fallback_to_ar = True
+                # Route B: gate may inject must_reply, so spec output is allowed to
+                # differ from the AR baseline. Keep the spec output for history;
+                # do NOT fall back to AR.
             else:
                 print("OK: Outputs match. Speculative decoding is lossless.")
  
@@ -340,7 +341,10 @@ class ProactiveInferenceClient:
                 self.generation_stats.append(turn_record)
                 print_generation_summary("Turn Summary", summarize_generation_stats([turn_record]))
 
-        history_reply_text = ar_text if self.compare_AR_SSD and 'ar_text' in locals() and reply_text != ar_text else reply_text
+        # Route B: always use the speculative output for history, even when it
+        # differs from the AR baseline (must_reply injection makes divergence
+        # expected, not a corruption to avoid).
+        history_reply_text = reply_text
         self.history.append({'role': 'assistant', 'content': history_reply_text, 'time': self.video_time})
 
     def inference(self, max_turns=None):
