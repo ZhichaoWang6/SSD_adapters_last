@@ -363,7 +363,22 @@ def kangaroo_speculative_generate(
                 new_first_logits = apply_repetition_penalty(
                     new_first_logits, new_input_ids[0], repetition_penalty, None,
                 )
-            blocked_first_token_id = None
+            # Route B (gate is the trigger authority; losslessness intentionally
+            # dropped): the gate said "respond", so forbid the base from STARTING
+            # a NO REPLY here. Mask EVERY first-token variant that begins a
+            # "NO REPLY" string — "NO" (==8996) AND " NO" (==5664, leading
+            # space). Last run only masked 8996, so the base escaped via 5664 and
+            # still emitted " NO REPLY". Enumerate variants so it cannot escape.
+            blocked = set()
+            for variant in ("NO", " NO"):
+                enc = tokenizer.encode(variant, add_special_tokens=False)
+                if enc:
+                    blocked.add(int(enc[0]))
+            if no_reply_token_ids:
+                blocked.add(int(no_reply_token_ids[0]))
+            for bid in blocked:
+                new_first_logits[..., bid] = float('-inf')
+            blocked_first_token_id = sorted(blocked)
             new_first_token = torch.argmax(new_first_logits, dim=-1)
 
             # Replace global_tokens with a bigger buffer that includes must_reply
