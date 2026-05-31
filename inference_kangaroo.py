@@ -293,105 +293,12 @@ def kangaroo_speculative_generate(
             stats['gate_skipped_spec'] = True
             stats['gate_must_reply_injected'] = False
             return output_ids, base_model.past_key_values, stats
-        else:
-            # Gate says "respond" → inject "I must reply.\n" to override the
-            # adapter's lm_head NO-REPLY bias, then take base's argmax at the
-            # new last position as first_token. Subsequent spec runs on the
-            # extended prompt (lossless to "base + must_reply prompt").
-            mr_ids_list = list(must_reply_token_ids) if must_reply_token_ids else \
-                tokenizer.encode("I must reply.\n", add_special_tokens=False)
-            mr_ids = torch.tensor(mr_ids_list, dtype=torch.long, device=device).unsqueeze(0)
-            N_mr = int(mr_ids.shape[1])
-
-            # Re-prefill base + adapter on extended input. Simplest correct
-            # path: rebuild the full forward (cheap relative to a full turn).
-            new_input_ids = torch.cat([inputs['input_ids'], mr_ids], dim=1)
-            new_attn_mask = None
-            if inputs.get('attention_mask') is not None:
-                new_attn_mask = torch.cat([
-                    inputs['attention_mask'],
-                    torch.ones((1, N_mr), dtype=inputs['attention_mask'].dtype, device=device),
-                ], dim=1)
-
-            mr_forward_kwargs = {
-                'input_ids': new_input_ids,
-                'attention_mask': new_attn_mask,
-                'use_cache': True,
-                'output_hidden_states': True,
-                'return_dict': True,
-                'past_key_values': None,
-                'pixel_values': inputs.get('pixel_values'),
-                'pixel_values_videos': inputs.get('pixel_values_videos'),
-                'image_grid_thw': inputs.get('image_grid_thw'),
-                'video_grid_thw': inputs.get('video_grid_thw'),
-                'second_per_grid_ts': inputs.get('second_per_grid_ts'),
-                'drop_method': 'none',
-                'drop_threshold': 1.0,
-                'drop_absolute': True,
-            }
-            mr_forward_kwargs = {k: v for k, v in mr_forward_kwargs.items() if v is not None}
-
-            mr_output = base_model.model(**mr_forward_kwargs)
-            base_model.past_key_values = mr_output.past_key_values
-            mr_hidden_early = mr_output.hidden_states[early_exit_layer]
-
-            mr_prefill_position_ids, _ = base_model.model.get_rope_index(
-                new_input_ids,
-                inputs.get('image_grid_thw'),
-                inputs.get('video_grid_thw'),
-                inputs.get('second_per_grid_ts'),
-                new_attn_mask,
-            )
-            mr_prefill_position_ids = mr_prefill_position_ids.to(mr_hidden_early.device)
-
-            _, adapter_past_key_values = adapter_model.forward_early_stop(
-                inputs_embeds=mr_hidden_early,
-                position_ids=mr_prefill_position_ids,
-                use_cache=True,
-            )
-
-            # New first token = base's argmax AFTER must_reply.
-            #
-            # We do NOT hard-mask the NO-REPLY first token here. Masking forced
-            # the base to "speak" on frames it wanted to stay silent on, turning
-            # gate false-alarms into garbage output and breaking losslessness.
-            # Instead we let the base pick freely: if it still chooses NO REPLY
-            # after the must_reply nudge, that is its honest decision and stays
-            # lossless.
-            new_first_logits = mr_output.logits[:, -1, :].float()
-            if repetition_penalty != 1.0:
-                new_first_logits = apply_repetition_penalty(
-                    new_first_logits, new_input_ids[0], repetition_penalty, None,
-                )
-            # No first-token filtering: after the must_reply nudge the base picks
-            # its first token freely (it may still choose NO REPLY / EOS — that is
-            # its honest decision).
-            blocked_first_token_id = None
-            new_first_token = torch.argmax(new_first_logits, dim=-1)
-
-            # Replace global_tokens with a bigger buffer that includes must_reply
-            new_context_length = int(new_input_ids.shape[1])
-            new_max_length = new_context_length + max_new_tokens
-            new_global_tokens = torch.full(
-                (batch_size, new_max_length), token_eos, dtype=torch.long, device=device,
-            )
-            new_global_tokens[:, :new_context_length] = new_input_ids
-            global_tokens = new_global_tokens
-            context_length = new_context_length
-            max_length = new_max_length
-
-            # Update first_token / start_index to point past must_reply
-            pre_must_reply_first_token_str = tokenizer.decode([int(first_token.item())])
-            first_token = new_first_token
-            start_index = context_length
-            global_tokens[:, start_index] = first_token.item()
-            prefill_position_ids = mr_prefill_position_ids
-
-            gate_must_reply_meta['gate_must_reply_injected'] = True
-            gate_must_reply_meta['gate_must_reply_len'] = N_mr
-            gate_must_reply_meta['pre_must_reply_first_token_str'] = pre_must_reply_first_token_str
-            gate_must_reply_meta['post_must_reply_first_token_str'] = tokenizer.decode([int(first_token.item())])
-            gate_must_reply_meta['blocked_no_reply_first_token_id'] = blocked_first_token_id
+        # else: gate says "respond" → do NOTHING special. Fall through to the
+        # normal speculative loop on the clean prompt. The base generates its
+        # own content (lossless); if the gate fired on a frame the base wants
+        # to stay silent on, the base honestly emits NO REPLY. We do NOT inject
+        # "I must reply." — that nudge fought the base's visual judgement and
+        # made genuinely-responsive frames collapse to NO REPLY.
 
     if DEBUG:
         print(f" first token :{tokenizer.decode(first_token)}")
