@@ -254,6 +254,7 @@ def kangaroo_speculative_generate(
         'gate_must_reply_len': 0,
         'pre_must_reply_first_token_str': None,
         'post_must_reply_first_token_str': None,
+        'blocked_no_reply_first_token_id': None,
     }
     if use_gate and getattr(adapter_model, 'use_gate_head', False):
         # Last prefill position == position right before generation
@@ -349,12 +350,23 @@ def kangaroo_speculative_generate(
                 use_cache=True,
             )
 
-            # New first token = base's argmax AFTER must_reply (no longer "N")
+            # New first token = base's argmax AFTER must_reply.
+            #
+            # Even with "I must reply." injected, on this checkpoint the base
+            # often still picks "NO" first — visual evidence outweighs the
+            # text-only instruction. Since the gate just said "respond", we
+            # commit: mask the NO-REPLY first token id(s) to -inf so base is
+            # physically unable to start a NO REPLY sequence. Forces a real
+            # content first token; subsequent positions follow naturally.
             new_first_logits = mr_output.logits[:, -1, :].float()
             if repetition_penalty != 1.0:
                 new_first_logits = apply_repetition_penalty(
                     new_first_logits, new_input_ids[0], repetition_penalty, None,
                 )
+            blocked_first_token_id = None
+            if no_reply_token_ids:
+                blocked_first_token_id = int(no_reply_token_ids[0])
+                new_first_logits[..., blocked_first_token_id] = float('-inf')
             new_first_token = torch.argmax(new_first_logits, dim=-1)
 
             # Replace global_tokens with a bigger buffer that includes must_reply
@@ -379,6 +391,7 @@ def kangaroo_speculative_generate(
             gate_must_reply_meta['gate_must_reply_len'] = N_mr
             gate_must_reply_meta['pre_must_reply_first_token_str'] = pre_must_reply_first_token_str
             gate_must_reply_meta['post_must_reply_first_token_str'] = tokenizer.decode([int(first_token.item())])
+            gate_must_reply_meta['blocked_no_reply_first_token_id'] = blocked_first_token_id
 
     if DEBUG:
         print(f" first token :{tokenizer.decode(first_token)}")
