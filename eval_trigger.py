@@ -45,13 +45,14 @@ def parse_args():
     p = argparse.ArgumentParser(description="Offline trigger (NO REPLY vs respond) evaluation")
     p.add_argument("--basepath", required=True, help="Base MMDuet2 ckpt (for lm_head + config + tokenizer)")
     p.add_argument("--datadir", required=True, help="Dir of .ckpt training files")
-    p.add_argument("--source", choices=["adapter", "base"], default="adapter",
+    p.add_argument("--source", choices=["adapter", "base", "gate"], default="adapter",
                    help="Whose trigger decision to evaluate. 'adapter' = early-exit "
-                        "hidden_state_layer{N} through the adapter (the deployed gate). "
-                        "'base' = the full model's final hidden_state through lm_head "
-                        "(the reference: how well the base model itself triggers). Same "
-                        "split / NO-token / miss-FA accounting, so the two are directly "
-                        "comparable.")
+                        "hidden_state_layer{N} through the adapter -> lm_head p(NO) "
+                        "(the OLD next-token signal; does not carry the trigger). "
+                        "'base' = full model's final hidden_state -> lm_head p(NO) "
+                        "(reference). 'gate' = the adapter's dedicated binary GATE HEAD "
+                        "(sigmoid -> p(respond)); this is the proper trigger signal. "
+                        "Same split / miss-FA accounting across all three.")
     p.add_argument("--adapter_path", default=None,
                    help="Dir with adapter_model.bin + adapter_config.json. Required for "
                         "--source adapter; ignored for --source base.")
@@ -86,11 +87,18 @@ def load_lm_head(basepath, hidden_size, vocab_size, dtype):
     return head.to(dtype)
 
 
-def load_adapter(basepath, adapter_path, num_adapter_layers, dtype):
-    cfg = create_adapter_config(basepath, num_adapter_layers=num_adapter_layers)
+def load_adapter(basepath, adapter_path, num_adapter_layers, dtype, want_gate=False):
     meta_path = os.path.join(adapter_path, "adapter_config.json")
+    gate_head = False
     if os.path.exists(meta_path):
         meta = json.load(open(meta_path))
+        gate_head = bool(meta.get("gate_head", False))
+    if want_gate and not gate_head:
+        raise ValueError(
+            f"--source gate but adapter_config.json has gate_head=False at {adapter_path}. "
+            f"This checkpoint was not trained with --gate_head.")
+    cfg = create_adapter_config(basepath, num_adapter_layers=num_adapter_layers, gate_head=gate_head)
+    if os.path.exists(meta_path):
         if "use_mlp" in meta:
             cfg.use_mlp = meta["use_mlp"]
         if "num_adapter_layers" in meta and meta["num_adapter_layers"] != num_adapter_layers:
@@ -140,10 +148,11 @@ def main():
     cfg = AutoConfig.from_pretrained(args.basepath)
     tok = AutoTokenizer.from_pretrained(args.basepath)
     head = load_lm_head(args.basepath, cfg.hidden_size, cfg.vocab_size, dtype).to(device)
-    if args.source == "adapter":
+    if args.source in ("adapter", "gate"):
         if args.adapter_path is None:
-            raise ValueError("--source adapter requires --adapter_path")
-        adapter = load_adapter(args.basepath, args.adapter_path, args.num_adapter_layers, dtype).to(device)
+            raise ValueError(f"--source {args.source} requires --adapter_path")
+        adapter = load_adapter(args.basepath, args.adapter_path, args.num_adapter_layers, dtype,
+                               want_gate=(args.source == "gate")).to(device)
     else:
         adapter = None
 
@@ -167,7 +176,7 @@ def main():
         d = torch.load(fp, map_location="cpu", weights_only=False)
         input_ids = d["input_ids"]
         loss_mask = d["loss_mask"]
-        if args.source == "adapter":
+        if args.source in ("adapter", "gate"):
             if layer_key not in d:
                 raise KeyError(f"{fp} has no {layer_key}; regenerate with --exit_layers {args.exit_layer}")
             early = d[layer_key].unsqueeze(0).to(device, dtype)  # (1, L, D)
@@ -198,15 +207,30 @@ def main():
         if not trig_positions:
             continue
         trig_hidden = hidden[0, trig_positions, :]            # (T, D)
-        logits = head(trig_hidden).float()                    # (T, V)
-        p_no = F.softmax(logits, dim=-1)[:, no_first_token].tolist()  # (T,)
-        argmax_tok = logits.argmax(dim=-1).tolist()
-        for i in range(len(trig_positions)):
-            records.append({
-                "gt_no_reply": gt_no_reply_flags[i],
-                "argmax": argmax_tok[i],
-                "p_no": p_no[i],
-            })
+        if args.source == "gate":
+            # Dedicated gate head: sigmoid -> p(respond). Define p_no = 1 - p_respond
+            # so the same threshold sweep (predict NO iff p_no>=t) applies. The
+            # argmax decision = predict NO iff p_respond < 0.5  <=>  p_no >= 0.5.
+            gate_logit = adapter.gate_logits(trig_hidden.unsqueeze(0))[0].float()  # (T,)
+            p_respond = torch.sigmoid(gate_logit)
+            p_no_t = (1.0 - p_respond).tolist()
+            argmax_is_no = (p_respond < 0.5).tolist()
+            for i in range(len(trig_positions)):
+                records.append({
+                    "gt_no_reply": gt_no_reply_flags[i],
+                    "argmax_is_no": bool(argmax_is_no[i]),
+                    "p_no": p_no_t[i],
+                })
+        else:
+            logits = head(trig_hidden).float()                    # (T, V)
+            p_no = F.softmax(logits, dim=-1)[:, no_first_token].tolist()  # (T,)
+            argmax_tok = logits.argmax(dim=-1).tolist()
+            for i in range(len(trig_positions)):
+                records.append({
+                    "gt_no_reply": gt_no_reply_flags[i],
+                    "argmax_is_no": (argmax_tok[i] == no_first_token),
+                    "p_no": p_no[i],
+                })
 
     if not records:
         print("No assistant turns found. Nothing to evaluate.")
@@ -257,7 +281,7 @@ def main():
 
     results = {}
     # Hard argmax decision
-    results["argmax"] = confusion(lambda r: r["argmax"] == no_first_token)
+    results["argmax"] = confusion(lambda r: r["argmax_is_no"])
     # p(NO REPLY) threshold sweep
     for t in [float(x) for x in args.thresholds.split(",") if x.strip()]:
         results[f"p_no>={t}"] = confusion(lambda r, t=t: r["p_no"] >= t)
