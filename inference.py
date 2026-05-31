@@ -139,13 +139,21 @@ class ProactiveInferenceClient:
         self.adapter_first_token = bool(getattr(args, 'adapter_first_token', False))
         self.use_gate = bool(getattr(args, 'use_gate', False))
         self.gate_threshold = float(getattr(args, 'gate_threshold', 0.5))
-        # Pre-tokenize "NO REPLY" once so the gate-skip path doesn't re-encode every turn
+        # Pre-tokenize the two literal strings the gate path uses, so we don't
+        # re-encode them every turn:
+        #   "NO REPLY"        — what to emit when gate says skip
+        #   "I must reply.\n" — what to inject into the prompt when gate says
+        #                       respond (overrides the adapter lm_head's
+        #                       NO REPLY bias so base actually starts content)
         tok = self.processor.tokenizer if hasattr(self.processor, 'tokenizer') else self.processor
         self.no_reply_token_ids = tok.encode("NO REPLY", add_special_tokens=False)
+        self.must_reply_text = "I must reply.\n"
+        self.must_reply_token_ids = tok.encode(self.must_reply_text, add_special_tokens=False)
         logger.info(f"repetition_penalty={self.repetition_penalty}, eos_token_ids={self.eos_token_ids}, "
                     f"adapter_first_token={self.adapter_first_token}, "
                     f"use_gate={self.use_gate}, gate_threshold={self.gate_threshold}, "
-                    f"no_reply_token_ids={self.no_reply_token_ids}")
+                    f"no_reply_token_ids={self.no_reply_token_ids}, "
+                    f"must_reply_token_ids={self.must_reply_token_ids}")
 
         self.history = list()
         self.prev_frame_before_token_drop = None    # for dynamic token drop
@@ -276,6 +284,8 @@ class ProactiveInferenceClient:
                 use_gate=self.use_gate,
                 gate_threshold=self.gate_threshold,
                 no_reply_token_ids=self.no_reply_token_ids,
+                must_reply_token_ids=self.must_reply_token_ids,
+                must_reply_text=self.must_reply_text,
             )
             spec_stats["context_len"] = context_len
             combined_stats = {'speculative': spec_stats}

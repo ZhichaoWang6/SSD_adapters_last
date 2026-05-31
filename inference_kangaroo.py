@@ -95,6 +95,7 @@ def kangaroo_speculative_generate(
     use_gate: bool = False,
     gate_threshold: float = 0.5,
     no_reply_token_ids=None,
+    must_reply_token_ids=None,
 ):
     # =======================
     adapter_correct = 0
@@ -243,9 +244,17 @@ def kangaroo_speculative_generate(
     # If --use_gate is enabled AND the loaded adapter has a gate head,
     # ask it whether to respond at all. If p(respond) < gate_threshold,
     # short-circuit: emit "NO REPLY" tokens directly and skip spec.
+    # If p(respond) >= threshold, inject "I must reply.\n" into the prompt
+    # to override the adapter's lm_head NO-REPLY bias before the spec loop.
     gate_used = False
     gate_prob = None
     gate_skipped_spec = False
+    gate_must_reply_meta = {
+        'gate_must_reply_injected': False,
+        'gate_must_reply_len': 0,
+        'pre_must_reply_first_token_str': None,
+        'post_must_reply_first_token_str': None,
+    }
     if use_gate and getattr(adapter_model, 'use_gate_head', False):
         # Last prefill position == position right before generation
         gate_logit = adapter_model.gate_logits(adapter_hidden_prefill[:, -1:, :]).float()
@@ -281,7 +290,95 @@ def kangaroo_speculative_generate(
             stats['gate_prob'] = gate_prob
             stats['gate_threshold'] = gate_threshold
             stats['gate_skipped_spec'] = True
+            stats['gate_must_reply_injected'] = False
             return output_ids, base_model.past_key_values, stats
+        else:
+            # Gate says "respond" → inject "I must reply.\n" to override the
+            # adapter's lm_head NO-REPLY bias, then take base's argmax at the
+            # new last position as first_token. Subsequent spec runs on the
+            # extended prompt (lossless to "base + must_reply prompt").
+            mr_ids_list = list(must_reply_token_ids) if must_reply_token_ids else \
+                tokenizer.encode("I must reply.\n", add_special_tokens=False)
+            mr_ids = torch.tensor(mr_ids_list, dtype=torch.long, device=device).unsqueeze(0)
+            N_mr = int(mr_ids.shape[1])
+
+            # Re-prefill base + adapter on extended input. Simplest correct
+            # path: rebuild the full forward (cheap relative to a full turn).
+            new_input_ids = torch.cat([inputs['input_ids'], mr_ids], dim=1)
+            new_attn_mask = None
+            if inputs.get('attention_mask') is not None:
+                new_attn_mask = torch.cat([
+                    inputs['attention_mask'],
+                    torch.ones((1, N_mr), dtype=inputs['attention_mask'].dtype, device=device),
+                ], dim=1)
+
+            mr_forward_kwargs = {
+                'input_ids': new_input_ids,
+                'attention_mask': new_attn_mask,
+                'use_cache': True,
+                'output_hidden_states': True,
+                'return_dict': True,
+                'past_key_values': None,
+                'pixel_values': inputs.get('pixel_values'),
+                'pixel_values_videos': inputs.get('pixel_values_videos'),
+                'image_grid_thw': inputs.get('image_grid_thw'),
+                'video_grid_thw': inputs.get('video_grid_thw'),
+                'second_per_grid_ts': inputs.get('second_per_grid_ts'),
+                'drop_method': 'none',
+                'drop_threshold': 1.0,
+                'drop_absolute': True,
+            }
+            mr_forward_kwargs = {k: v for k, v in mr_forward_kwargs.items() if v is not None}
+
+            mr_output = base_model.model(**mr_forward_kwargs)
+            base_model.past_key_values = mr_output.past_key_values
+            mr_hidden_early = mr_output.hidden_states[early_exit_layer]
+
+            mr_prefill_position_ids, _ = base_model.model.get_rope_index(
+                new_input_ids,
+                inputs.get('image_grid_thw'),
+                inputs.get('video_grid_thw'),
+                inputs.get('second_per_grid_ts'),
+                new_attn_mask,
+            )
+            mr_prefill_position_ids = mr_prefill_position_ids.to(mr_hidden_early.device)
+
+            _, adapter_past_key_values = adapter_model.forward_early_stop(
+                inputs_embeds=mr_hidden_early,
+                position_ids=mr_prefill_position_ids,
+                use_cache=True,
+            )
+
+            # New first token = base's argmax AFTER must_reply (no longer "N")
+            new_first_logits = mr_output.logits[:, -1, :].float()
+            if repetition_penalty != 1.0:
+                new_first_logits = apply_repetition_penalty(
+                    new_first_logits, new_input_ids[0], repetition_penalty, None,
+                )
+            new_first_token = torch.argmax(new_first_logits, dim=-1)
+
+            # Replace global_tokens with a bigger buffer that includes must_reply
+            new_context_length = int(new_input_ids.shape[1])
+            new_max_length = new_context_length + max_new_tokens
+            new_global_tokens = torch.full(
+                (batch_size, new_max_length), token_eos, dtype=torch.long, device=device,
+            )
+            new_global_tokens[:, :new_context_length] = new_input_ids
+            global_tokens = new_global_tokens
+            context_length = new_context_length
+            max_length = new_max_length
+
+            # Update first_token / start_index to point past must_reply
+            pre_must_reply_first_token_str = tokenizer.decode([int(first_token.item())])
+            first_token = new_first_token
+            start_index = context_length
+            global_tokens[:, start_index] = first_token.item()
+            prefill_position_ids = mr_prefill_position_ids
+
+            gate_must_reply_meta['gate_must_reply_injected'] = True
+            gate_must_reply_meta['gate_must_reply_len'] = N_mr
+            gate_must_reply_meta['pre_must_reply_first_token_str'] = pre_must_reply_first_token_str
+            gate_must_reply_meta['post_must_reply_first_token_str'] = tokenizer.decode([int(first_token.item())])
 
     if DEBUG:
         print(f" first token :{tokenizer.decode(first_token)}")
@@ -300,6 +397,7 @@ def kangaroo_speculative_generate(
         stats['gate_prob'] = gate_prob
         stats['gate_threshold'] = gate_threshold if use_gate else None
         stats['gate_skipped_spec'] = False
+        stats.update(gate_must_reply_meta)
         return output_ids, base_model.past_key_values, stats
 
     # ========== Draft-Verify Loop ==========
@@ -567,6 +665,7 @@ def kangaroo_speculative_generate(
     stats['gate_prob'] = gate_prob
     stats['gate_threshold'] = gate_threshold if use_gate else None
     stats['gate_skipped_spec'] = False
+    stats.update(gate_must_reply_meta)
     stats['draft_accept_per_round'] = draft_accept_per_round
     #==============================================================================================================
 
@@ -588,6 +687,8 @@ def speculative_generate_for_streaming(
     use_gate: bool = False,
     gate_threshold: float = 0.5,
     no_reply_token_ids=None,
+    must_reply_token_ids=None,
+    must_reply_text: str = "I must reply.\n",
 ):
     output_ids, past_key_values, stats = kangaroo_speculative_generate(
         model=model,
@@ -605,14 +706,25 @@ def speculative_generate_for_streaming(
         use_gate=use_gate,
         gate_threshold=gate_threshold,
         no_reply_token_ids=no_reply_token_ids,
+        must_reply_token_ids=must_reply_token_ids,
     )
     # print(f"Speculative generation completed. Stats: {stats}")
 
+    # When gate injected "I must reply." into the prompt, output_ids now
+    # contains [original prompt | must_reply tokens | generated tokens].
+    # Skip both the original prompt and the must_reply chunk so the visible
+    # reply_text only contains the actual generated content.
     input_length = inputs['input_ids'].shape[1]
-    # print(f"Input length: {input_length}, Output length: {output_ids.shape[1]}, New tokens generated: {output_ids.shape[1] - input_length}")
-    new_token_ids = output_ids[:, input_length:]
+    mr_len = int(stats.get('gate_must_reply_len', 0) or 0)
+    new_token_ids = output_ids[:, input_length + mr_len:]
 
     tokenizer = processor.tokenizer if hasattr(processor, 'tokenizer') else processor
     reply_text = tokenizer.batch_decode(new_token_ids, skip_special_tokens=True)[0]
+
+    # Safety net: if for any reason must_reply text leaks into the decoded
+    # string (e.g. tokenization boundary differences), strip it.
+    if stats.get('gate_must_reply_injected') and must_reply_text:
+        if reply_text.startswith(must_reply_text):
+            reply_text = reply_text[len(must_reply_text):]
 
     return reply_text, past_key_values, stats
