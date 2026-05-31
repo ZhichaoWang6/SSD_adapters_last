@@ -89,10 +89,25 @@ class KangarooQwenModel(nn.Module):
                 )
             num_adapter_layers = ckpt_n
 
-        # Read gate_head flag from adapter_config.json (recorded at training).
-        # When True, AdapterModel adds a binary Linear head used as a proactive
-        # trigger ("respond now?"). Default False keeps backward compatibility.
+        # Decide whether to build the gate_head module before instantiating the
+        # adapter. Priority:
+        #   1. adapter_config.json has "gate_head": true  → enable
+        #   2. The checkpoint state_dict contains "gate_head.weight"  → enable
+        #      (handles checkpoints whose adapter_config.json was saved without
+        #      the field, but the gate weights are in the .bin)
+        # If the user does not pass --use_gate at inference, the gate module is
+        # still built but the spec function just never calls it.
         gate_head_flag = bool(adapter_meta.get("gate_head", False))
+        if not gate_head_flag and adapter_ckpt is not None and os.path.exists(adapter_ckpt):
+            try:
+                _peek_keys = list(torch.load(adapter_ckpt, map_location='cpu',
+                                             weights_only=True).keys())
+                if any(k.endswith('gate_head.weight') for k in _peek_keys):
+                    gate_head_flag = True
+                    print("[kangaroo_model] auto-enabled gate_head: detected "
+                          "gate_head.weight in adapter checkpoint")
+            except Exception as e:
+                print(f"[kangaroo_model] could not peek adapter ckpt for gate: {e}")
 
         # Create adapter config with resolved layer count + gate flag
         adapter_config = create_adapter_config(
