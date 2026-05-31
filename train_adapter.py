@@ -68,6 +68,14 @@ def parse_args():
                              "the lm_head CE path; lets the adapter decide NO REPLY vs respond.")
     parser.add_argument("--gate_weight", type=float, default=1.0,
                         help="Weight of the gate BCE loss added to the total loss.")
+    parser.add_argument("--gate_lr", type=float, default=0.0,
+                        help="Separate LR for the (freshly-initialized) gate head. "
+                             "0 = share --lr. Ignored unless --gate_head.")
+    parser.add_argument("--freeze_backbone", action="store_true",
+                        help="Stage-2 gate-only training: freeze every adapter param "
+                             "except gate_head, so the pre-trained speculative backbone is "
+                             "untouched and only the trigger gate is learned. Pair with "
+                             "--prefix_ce_weight 0 --kl_weight 0 to compute gate BCE alone.")
     parser.add_argument("--gate_pos_weight", type=float, default=0.0,
                         help="BCE pos_weight for the respond class. 0 = auto (neg/pos ratio "
                              "computed per batch). Set e.g. 6.0 to fix it.")
@@ -938,7 +946,39 @@ def main():
         if args.init_from_base_layer >= 0:
             print(f"  (note: --init_from_base_layer was set but ignored because --resume_adapter takes precedence)")
 
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95))
+    # Stage-2 gate-only: freeze everything except the gate head so the
+    # pre-trained speculative backbone is preserved and only the trigger is
+    # learned. Done before building the optimizer so frozen params are excluded.
+    if args.freeze_backbone:
+        if not args.gate_head:
+            raise ValueError("--freeze_backbone requires --gate_head (nothing else trains)")
+        n_frozen = 0
+        for name, p in model.named_parameters():
+            if not name.startswith("gate_head."):
+                p.requires_grad = False
+                n_frozen += 1
+        if accelerator.is_main_process:
+            print(f"[freeze_backbone] froze {n_frozen} params; training gate_head only.")
+
+    # Gate head is freshly initialized, so it can take a larger LR than the
+    # pre-trained backbone. If --gate_lr is set (>0), put gate_head params in
+    # their own param group; otherwise everything shares --lr. Only params that
+    # still require grad are handed to the optimizer.
+    gate_lr = args.gate_lr if (args.gate_head and args.gate_lr > 0) else args.lr
+    gate_params, base_params = [], []
+    for n, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        (gate_params if n.startswith("gate_head.") else base_params).append(p)
+    groups = []
+    if base_params:
+        groups.append({"params": base_params, "lr": args.lr})
+    if gate_params:
+        groups.append({"params": gate_params, "lr": gate_lr})
+    optimizer = optim.AdamW(groups, betas=(0.9, 0.95))
+    if accelerator.is_main_process:
+        print(f"Optimizer: backbone params={len(base_params)}@lr{args.lr}, "
+              f"gate params={len(gate_params)}@lr{gate_lr}")
     model, head, optimizer, train_loader = accelerator.prepare(
         model, head, optimizer, train_loader
     )
