@@ -44,6 +44,15 @@ def parse_args():
                              "(i.e. the 'should I respond' decision) instead of base "
                              "prefill's argmax. Spec output is no longer lossless to base "
                              "when enabled; probe of adapter's standalone trigger capability.")
+    parser.add_argument("--use_gate", action="store_true",
+                        help="Use adapter's binary gate head (trained on the dreamy-ride "
+                             "branch) as the proactive-response trigger. When gate sigmoid "
+                             "p(respond) < --gate_threshold, the turn emits 'NO REPLY' "
+                             "directly and skips speculative decoding entirely. Requires "
+                             "an adapter checkpoint whose adapter_config.json has "
+                             "gate_head=true.")
+    parser.add_argument("--gate_threshold", type=float, default=0.5,
+                        help="Sigmoid threshold for the gate head; respond iff p >= this.")
     parser.add_argument("--device", type=str, default="cuda:4")
 
     # generation args
@@ -128,8 +137,15 @@ class ProactiveInferenceClient:
                 [int(tok_eos)] if tok_eos is not None else None
             )
         self.adapter_first_token = bool(getattr(args, 'adapter_first_token', False))
+        self.use_gate = bool(getattr(args, 'use_gate', False))
+        self.gate_threshold = float(getattr(args, 'gate_threshold', 0.5))
+        # Pre-tokenize "NO REPLY" once so the gate-skip path doesn't re-encode every turn
+        tok = self.processor.tokenizer if hasattr(self.processor, 'tokenizer') else self.processor
+        self.no_reply_token_ids = tok.encode("NO REPLY", add_special_tokens=False)
         logger.info(f"repetition_penalty={self.repetition_penalty}, eos_token_ids={self.eos_token_ids}, "
-                    f"adapter_first_token={self.adapter_first_token}")
+                    f"adapter_first_token={self.adapter_first_token}, "
+                    f"use_gate={self.use_gate}, gate_threshold={self.gate_threshold}, "
+                    f"no_reply_token_ids={self.no_reply_token_ids}")
 
         self.history = list()
         self.prev_frame_before_token_drop = None    # for dynamic token drop
@@ -257,6 +273,9 @@ class ProactiveInferenceClient:
                 repetition_penalty=self.repetition_penalty,
                 eos_token_ids=self.eos_token_ids,
                 adapter_first_token=self.adapter_first_token,
+                use_gate=self.use_gate,
+                gate_threshold=self.gate_threshold,
+                no_reply_token_ids=self.no_reply_token_ids,
             )
             spec_stats["context_len"] = context_len
             combined_stats = {'speculative': spec_stats}

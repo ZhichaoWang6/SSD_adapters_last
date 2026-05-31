@@ -92,6 +92,9 @@ def kangaroo_speculative_generate(
     repetition_penalty: float = 1.0,
     eos_token_ids=None,
     adapter_first_token: bool = False,
+    use_gate: bool = False,
+    gate_threshold: float = 0.5,
+    no_reply_token_ids=None,
 ):
     # =======================
     adapter_correct = 0
@@ -236,6 +239,50 @@ def kangaroo_speculative_generate(
     draft_times = []
     verify_times = []
 
+    # ========== Gate decision (proactive-response trigger) ==========
+    # If --use_gate is enabled AND the loaded adapter has a gate head,
+    # ask it whether to respond at all. If p(respond) < gate_threshold,
+    # short-circuit: emit "NO REPLY" tokens directly and skip spec.
+    gate_used = False
+    gate_prob = None
+    gate_skipped_spec = False
+    if use_gate and getattr(adapter_model, 'use_gate_head', False):
+        # Last prefill position == position right before generation
+        gate_logit = adapter_model.gate_logits(adapter_hidden_prefill[:, -1:, :]).float()
+        gate_prob = torch.sigmoid(gate_logit).item()
+        gate_used = True
+        if gate_prob < gate_threshold:
+            # Gate says "do not respond" → write NO REPLY tokens and return
+            no_reply_ids = list(no_reply_token_ids) if no_reply_token_ids else []
+            if not no_reply_ids:
+                # Fallback: tokenize the string on the fly
+                no_reply_ids = tokenizer.encode("NO REPLY", add_special_tokens=False)
+            # Ensure trailing EOS so downstream stops cleanly
+            eos_for_close = next(iter(token_eos_set))
+            if not no_reply_ids or no_reply_ids[-1] not in token_eos_set:
+                no_reply_ids = no_reply_ids + [int(eos_for_close)]
+            # Bound by max_length
+            write_end = min(start_index + len(no_reply_ids), max_length)
+            for i, tid in enumerate(no_reply_ids[: write_end - start_index]):
+                global_tokens[0, start_index + i] = int(tid)
+            start_index = write_end - 1   # last written position
+            output_ids = global_tokens[:, : start_index + 1]
+            torch.cuda.synchronize() if torch.cuda.is_available() else None
+            total_time = time.perf_counter() - t_start
+            stats = _build_stats([], prefill_time, [], [], total_time,
+                                 max(1, len(no_reply_ids)))
+            stats['first_token_used_adapter'] = adapter_first_token
+            stats['first_token_disagree_with_base'] = first_token_disagree
+            stats['first_token_id'] = int(first_token.item())
+            stats['base_first_token_id'] = int(base_first_token.item())
+            stats['first_token_str'] = tokenizer.decode([int(first_token.item())])
+            stats['base_first_token_str'] = tokenizer.decode([int(base_first_token.item())])
+            stats['gate_used'] = True
+            stats['gate_prob'] = gate_prob
+            stats['gate_threshold'] = gate_threshold
+            stats['gate_skipped_spec'] = True
+            return output_ids, base_model.past_key_values, stats
+
     if DEBUG:
         print(f" first token :{tokenizer.decode(first_token)}")
     if first_token.item() in token_eos_set:
@@ -249,6 +296,10 @@ def kangaroo_speculative_generate(
         stats['base_first_token_id'] = int(base_first_token.item())
         stats['first_token_str'] = tokenizer.decode([int(first_token.item())])
         stats['base_first_token_str'] = tokenizer.decode([int(base_first_token.item())])
+        stats['gate_used'] = gate_used
+        stats['gate_prob'] = gate_prob
+        stats['gate_threshold'] = gate_threshold if use_gate else None
+        stats['gate_skipped_spec'] = False
         return output_ids, base_model.past_key_values, stats
 
     # ========== Draft-Verify Loop ==========
@@ -512,6 +563,10 @@ def kangaroo_speculative_generate(
     stats['base_first_token_id'] = int(base_first_token.item())
     stats['first_token_str'] = tokenizer.decode([int(first_token.item())])
     stats['base_first_token_str'] = tokenizer.decode([int(base_first_token.item())])
+    stats['gate_used'] = gate_used
+    stats['gate_prob'] = gate_prob
+    stats['gate_threshold'] = gate_threshold if use_gate else None
+    stats['gate_skipped_spec'] = False
     stats['draft_accept_per_round'] = draft_accept_per_round
     #==============================================================================================================
 
@@ -530,6 +585,9 @@ def speculative_generate_for_streaming(
     repetition_penalty: float = 1.0,
     eos_token_ids=None,
     adapter_first_token: bool = False,
+    use_gate: bool = False,
+    gate_threshold: float = 0.5,
+    no_reply_token_ids=None,
 ):
     output_ids, past_key_values, stats = kangaroo_speculative_generate(
         model=model,
@@ -544,6 +602,9 @@ def speculative_generate_for_streaming(
         repetition_penalty=repetition_penalty,
         eos_token_ids=eos_token_ids,
         adapter_first_token=adapter_first_token,
+        use_gate=use_gate,
+        gate_threshold=gate_threshold,
+        no_reply_token_ids=no_reply_token_ids,
     )
     # print(f"Speculative generation completed. Stats: {stats}")
 

@@ -89,8 +89,17 @@ class KangarooQwenModel(nn.Module):
                 )
             num_adapter_layers = ckpt_n
 
-        # Create adapter config with resolved layer count
-        adapter_config = create_adapter_config(base_model_path, num_adapter_layers=num_adapter_layers)
+        # Read gate_head flag from adapter_config.json (recorded at training).
+        # When True, AdapterModel adds a binary Linear head used as a proactive
+        # trigger ("respond now?"). Default False keeps backward compatibility.
+        gate_head_flag = bool(adapter_meta.get("gate_head", False))
+
+        # Create adapter config with resolved layer count + gate flag
+        adapter_config = create_adapter_config(
+            base_model_path,
+            num_adapter_layers=num_adapter_layers,
+            gate_head=gate_head_flag,
+        )
 
         if "use_mlp" in adapter_meta:
             adapter_config.use_mlp = adapter_meta["use_mlp"]
