@@ -461,13 +461,20 @@ def _metrics(turn_stats):
             'first_token_disagree': s.get('first_token_disagree_with_base', False),
             'first_token_str': s.get('first_token_str', ''),
             'base_first_token_str': s.get('base_first_token_str', ''),
+            # Gate probe (only meaningful when --use_gate):
+            'gate_used': s.get('gate_used', False),
+            'gate_prob': s.get('gate_prob', None),
+            'gate_skipped_spec': s.get('gate_skipped_spec', False),
         })
 
-    # First-token disagreement aggregate
+    # First-token + gate aggregates
     first_token_disagree_n = sum(
         1 for s in spec if s.get('first_token_disagree_with_base', False)
     )
     used_adapter_first = any(s.get('first_token_used_adapter', False) for s in spec)
+    gate_probs = [s.get('gate_prob') for s in spec if s.get('gate_prob') is not None]
+    gate_skipped_n = sum(1 for s in spec if s.get('gate_skipped_spec', False))
+    gate_was_used = any(s.get('gate_used', False) for s in spec)
 
     return {
         'turns': len(spec),
@@ -498,6 +505,13 @@ def _metrics(turn_stats):
         'first_token_used_adapter': used_adapter_first,
         'first_token_disagree_count': first_token_disagree_n,
         'first_token_disagree_rate': _safe_div(first_token_disagree_n, len(spec)),
+        'gate_used': gate_was_used,
+        'gate_skipped_count': gate_skipped_n,
+        'gate_skip_rate': _safe_div(gate_skipped_n, len(spec)),
+        'gate_prob_mean': (sum(gate_probs) / len(gate_probs)) if gate_probs else None,
+        'gate_prob_min': min(gate_probs) if gate_probs else None,
+        'gate_prob_max': max(gate_probs) if gate_probs else None,
+        'gate_probs': gate_probs,
     }
 
 
@@ -539,6 +553,16 @@ def _print_metrics(label, m):
             f"    first-token probe (adapter): disagree {d}/{n} "
             f"({m['first_token_disagree_rate']:.1%}) vs base"
         )
+    if m.get('gate_used'):
+        n = m['turns']
+        s = m['gate_skipped_count']
+        p_mean = m.get('gate_prob_mean')
+        p_min = m.get('gate_prob_min')
+        p_max = m.get('gate_prob_max')
+        print(
+            f"    gate: skipped_spec {s}/{n} ({m['gate_skip_rate']:.1%}) | "
+            f"prob mean={p_mean:.3f} min={p_min:.3f} max={p_max:.3f}"
+        )
 
 
 def print_generation_summary(title, summary):
@@ -555,7 +579,13 @@ def print_generation_summary(title, summary):
             bt = t.get('base_first_token_str', '').replace('\n', '\\n')
             tag = "DISAGREE" if t.get('first_token_disagree') else "agree"
             first_info = f" | first: adapter='{ft}' base='{bt}' ({tag})"
-        print(f"  turn {turn_idx}: steps={t['steps']} | accept={t['accept_lengths']} | round_speedup={round_speedup}{first_info}")
+        gate_info = ""
+        if t.get('gate_used'):
+            p = t.get('gate_prob')
+            if p is not None:
+                skip = "SKIP" if t.get('gate_skipped_spec') else "pass"
+                gate_info = f" | gate: p={p:.3f} ({skip})"
+        print(f"  turn {turn_idx}: steps={t['steps']} | accept={t['accept_lengths']} | round_speedup={round_speedup}{first_info}{gate_info}")
     for label, key in (('Short/NO_REPLY <=5 tok', 'short_reply'), ('Long >5 tok', 'long_reply')):
         bucket = summary.get(key)
         if bucket and bucket['turns']:
