@@ -315,6 +315,20 @@ class ProactiveInferenceClient:
  
             # 对比
             print(f"\\n===== Lossless Check =====")
+            # DIAG: confirm spec and AR saw identical input + clean base state.
+            # diag_verify.py shows kangaroo_speculative_generate is lossless in a
+            # single-turn sandbox, so any divergence here must come from the
+            # streaming pipeline's per-turn state (keep_mask / rope_deltas /
+            # all_keep_masks) differing between the spec call and the AR call.
+            try:
+                _ids = inputs['input_ids']
+                print(f"[diag] ctx_len={context_len} input_ids.shape={tuple(_ids.shape)} "
+                      f"last10={_ids[0, -10:].tolist()}")
+                _akm = getattr(self.model.model, 'all_keep_masks', None)
+                print(f"[diag] all_keep_masks len={len(_akm) if _akm is not None else 'None'} "
+                      f"rope_deltas={getattr(self.kangaroo_model.base_model.model, 'rope_deltas', 'NA')}")
+            except Exception as _e:
+                print(f"[diag] state probe failed: {_e}")
             print(f"Speculative output: {reply_text}")
             print(f"AR manual output:   {ar_text}")
             output_match = reply_text == ar_text
