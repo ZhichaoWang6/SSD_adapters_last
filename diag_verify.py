@@ -46,13 +46,13 @@ def parse_args():
 
 
 @torch.no_grad()
-def run_spec(model, proc, inputs, steps, exit_layer):
+def run_spec(model, proc, inputs, steps, exit_layer, threshold=0.0):
     model.reset_status()
     eos = model.base_model.model.generation_config.eos_token_id
     out_ids, _, stats = kangaroo_speculative_generate(
         model=model, inputs=inputs, processor=proc, past_key_values=None,
         max_new_tokens=256, early_exit_layer=exit_layer,
-        speculative_steps=steps, threshold=0.0,  # threshold 0 => never early-stop draft
+        speculative_steps=steps, threshold=threshold,
         eos_token_ids=eos,
     )
     ctx = inputs["input_ids"].shape[1]
@@ -112,8 +112,8 @@ def main():
     print("\nAR text:", ar_txt)
     print("AR ids :", ar_ids[:40])
 
-    for steps in (1, 6):
-        spec_ids = run_spec(model, proc, inputs, steps, args.exit_layer)
+    for steps, thr in ((1, 0.0), (6, 0.0), (6, 0.6)):
+        spec_ids = run_spec(model, proc, inputs, steps, args.exit_layer, threshold=thr)
         spec_txt = tok.decode(spec_ids, skip_special_tokens=True)
         match = (spec_txt.strip() == ar_txt.strip())
         # first divergence position
@@ -122,7 +122,7 @@ def main():
             if spec_ids[i] != ar_ids[i]:
                 fd = i
                 break
-        print(f"\n=== spec steps={steps} ===")
+        print(f"\n=== spec steps={steps} threshold={thr} ===")
         print("spec text:", spec_txt)
         print("MATCH AR?", match, "| first divergence idx:", fd)
         if fd is not None:
@@ -133,9 +133,9 @@ def main():
                   [tok.decode([x]) for x in spec_ids[lo:fd+3]])
 
     print("\nInterpretation:")
-    print("  steps=1 matches, steps=6 diverges -> multi-token round / KV-trim bug")
-    print("  steps=1 also diverges            -> per-round re-entry / cache bug")
-    print("  both match                       -> earlier non-lossless was the gate path")
+    print("  threshold=0 matches but threshold=0.6 diverges -> the early-stop-draft")
+    print("    break path (predict_score < threshold) corrupts verify/KV alignment.")
+    print("  all match -> non-lossless came from elsewhere (gate path).")
 
 
 if __name__ == "__main__":
